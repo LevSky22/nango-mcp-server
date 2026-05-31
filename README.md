@@ -32,26 +32,17 @@ Management API responses are redacted for credential-like fields. `proxy_request
 
 ## Install
 
-Using a virtual environment is recommended because MCP clients launch the server as a long-lived subprocess, and an isolated Python environment avoids conflicts with system Python packages.
+Recommended for MCP clients:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[test]"
+uvx --from git+https://github.com/LevSky22/nango-mcp-server.git nango-mcp
 ```
 
-For a normal editable install without test extras:
+`uvx` is the Python equivalent of the `npx` pattern commonly used by MCP servers: it runs the package in an isolated environment without making you manage a project virtualenv.
 
-```bash
-pip install -e .
-```
+This requires `uv` / `uvx` to be installed. If you do not use `uv`, use `pipx` instead.
 
-If you installed into a virtual environment, use the virtualenv's `nango-mcp` command path in your MCP client config, for example:
-
-```bash
-/absolute/path/to/.venv/bin/nango-mcp
-```
-
-If you prefer a user-level install, `pipx` is also a good fit:
+For a persistent user-level install:
 
 ```bash
 pipx install git+https://github.com/LevSky22/nango-mcp-server.git
@@ -61,6 +52,21 @@ Then your MCP client can use:
 
 ```bash
 nango-mcp
+```
+
+For local development:
+
+```bash
+git clone https://github.com/LevSky22/nango-mcp-server.git
+cd nango-mcp-server
+python3 -m venv .venv
+.venv/bin/pip install -e ".[test]"
+```
+
+Use the virtualenv command path in MCP configs when working from a checkout:
+
+```bash
+/absolute/path/to/nango-mcp-server/.venv/bin/nango-mcp
 ```
 
 ## Configuration
@@ -137,13 +143,18 @@ For environment `prod`, the default template reads secret `NANGO_SECRET_KEY` fro
 
 ## MCP Client Example
 
-Generic MCP JSON:
+Generic MCP JSON using `uvx`:
 
 ```json
 {
   "mcpServers": {
     "nango": {
-      "command": "nango-mcp",
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/LevSky22/nango-mcp-server.git",
+        "nango-mcp"
+      ],
       "env": {
         "NANGO_MCP_ENV_FILE": "/absolute/path/to/.env"
       }
@@ -154,51 +165,39 @@ Generic MCP JSON:
 
 ### Codex CLI
 
-Install the package. A virtual environment keeps dependencies isolated and gives Codex a stable command path:
+Use Codex's MCP command:
 
 ```bash
-git clone https://github.com/LevSky22/nango-mcp-server.git
-cd nango-mcp-server
-python3 -m venv .venv
-.venv/bin/pip install -e .
-cp .env.example .env
-chmod 600 .env
+codex mcp add nango \
+  --env NANGO_MCP_ENV_FILE=/absolute/path/to/.env \
+  -- uvx --from git+https://github.com/LevSky22/nango-mcp-server.git nango-mcp
 ```
 
-Then add an MCP server entry to your Codex config. The exact config path can vary by installation, but the server entry should point at the installed command and pass the absolute `.env` path:
+Or edit `~/.codex/config.toml` directly:
 
 ```toml
 [mcp_servers.nango]
-command = "/absolute/path/to/nango-mcp-server/.venv/bin/nango-mcp"
+command = "uvx"
+args = ["--from", "git+https://github.com/LevSky22/nango-mcp-server.git", "nango-mcp"]
 
 [mcp_servers.nango.env]
-NANGO_MCP_ENV_FILE = "/absolute/path/to/nango-mcp-server/.env"
+NANGO_MCP_ENV_FILE = "/absolute/path/to/.env"
 ```
 
-If you installed with `pipx`, use `command = "nango-mcp"` instead. Restart Codex after editing the config.
+If you installed with `pipx`, use `command = "nango-mcp"` and remove `args`. Restart Codex after editing the config.
 
 ### Claude Code
 
-Install the package. A virtual environment keeps dependencies isolated and gives Claude Code a stable command path:
+Add the server with Claude Code's MCP command:
 
 ```bash
-git clone https://github.com/LevSky22/nango-mcp-server.git
-cd nango-mcp-server
-python3 -m venv .venv
-.venv/bin/pip install -e .
-cp .env.example .env
-chmod 600 .env
+claude mcp add --transport stdio \
+  --env NANGO_MCP_ENV_FILE=/absolute/path/to/.env \
+  nango \
+  -- uvx --from git+https://github.com/LevSky22/nango-mcp-server.git nango-mcp
 ```
 
-Then add the server with Claude Code's MCP command:
-
-```bash
-claude mcp add nango \
-  --env NANGO_MCP_ENV_FILE=/absolute/path/to/nango-mcp-server/.env \
-  -- /absolute/path/to/nango-mcp-server/.venv/bin/nango-mcp
-```
-
-If you installed with `pipx`, replace the command path with `nango-mcp`. Restart Claude Code, or reload MCP servers if your client supports it.
+If you installed with `pipx`, replace everything after `--` with `nango-mcp`. Restart Claude Code, or reload MCP servers if your client supports it.
 
 ### Starter Prompt
 
