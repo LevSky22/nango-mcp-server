@@ -43,9 +43,22 @@ For a normal editable install without test extras:
 pip install -e .
 ```
 
+If you installed into a virtual environment, use the virtualenv's `nango-mcp` command path in your MCP client config, for example:
+
+```bash
+/absolute/path/to/.venv/bin/nango-mcp
+```
+
 ## Configuration
 
-The server loads `.env` from the current working directory by default. Override with:
+Create a `.env` file for the MCP server. If you run `nango-mcp` from this project checkout, `.env` can live in the repository root:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+If your MCP client launches `nango-mcp` from another working directory, set `NANGO_MCP_ENV_FILE` to an absolute path so the server can find the file reliably:
 
 ```bash
 NANGO_MCP_ENV_FILE=/path/to/.env
@@ -58,6 +71,19 @@ NANGO_BASE_URL=https://api.nango.dev
 NANGO_ENVIRONMENT=default
 NANGO_SECRET_KEY=nango_secret_key_here
 ```
+
+### Finding Your Nango Secret Key
+
+`NANGO_SECRET_KEY` is the Nango environment secret key, not a provider OAuth client secret and not a provider API key.
+
+In the Nango UI:
+
+1. Select the Nango environment you want this MCP server to operate against.
+2. Open that environment's **Environment Settings**.
+3. Copy the **Secret Key**.
+4. Put it in your local `.env` as `NANGO_SECRET_KEY`, or as `NANGO_SECRET_KEY_<ENV>` for a multi-environment setup.
+
+Nango uses this key as the bearer token for backend/API requests. Anyone with this key can operate against that Nango environment, so keep it server-side and never commit it.
 
 Multiple environments:
 
