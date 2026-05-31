@@ -88,7 +88,10 @@ async def _resolve(environment: str, *, refresh: bool = False) -> tuple[Settings
 
 
 def _assert_confirmation(value: str, expected: str) -> None:
-    if value != expected:
+    settings, _, _ = _runtime()
+    if settings.read_only:
+        raise ValueError("This Nango MCP server is running in read-only mode")
+    if settings.require_confirmation and value != expected:
         raise ValueError(f"confirmation must exactly equal: {expected}")
 
 
@@ -318,7 +321,7 @@ async def search_provider_templates(
 
 
 @mcp.tool()
-async def create_integration(environment: str, payload: dict[str, Any], confirmation: str) -> Any:
+async def create_integration(environment: str, payload: dict[str, Any], confirmation: str = "") -> Any:
     """Create a Nango integration using the Nango API payload shape."""
     _assert_confirmation(confirmation, WRITE_CONFIRMATION)
     _, nango, secret = await _resolve(environment)
@@ -326,7 +329,7 @@ async def create_integration(environment: str, payload: dict[str, Any], confirma
 
 
 @mcp.tool()
-async def update_integration(environment: str, integration_id: str, fields: dict[str, Any], confirmation: str) -> Any:
+async def update_integration(environment: str, integration_id: str, fields: dict[str, Any], confirmation: str = "") -> Any:
     """Patch a Nango integration."""
     _assert_confirmation(confirmation, WRITE_CONFIRMATION)
     _, nango, secret = await _resolve(environment)
@@ -334,7 +337,7 @@ async def update_integration(environment: str, integration_id: str, fields: dict
 
 
 @mcp.tool()
-async def delete_integration(environment: str, integration_id: str, confirmation: str) -> Any:
+async def delete_integration(environment: str, integration_id: str, confirmation: str = "") -> Any:
     """Delete a Nango integration."""
     _assert_confirmation(confirmation, DELETE_CONFIRMATION)
     _, nango, secret = await _resolve(environment)
@@ -430,7 +433,7 @@ async def get_connection_context(
 
 
 @mcp.tool()
-async def import_connection(environment: str, payload: dict[str, Any], confirmation: str) -> Any:
+async def import_connection(environment: str, payload: dict[str, Any], confirmation: str = "") -> Any:
     """Import/create a connection using the Nango API payload shape."""
     _assert_confirmation(confirmation, WRITE_CONFIRMATION)
     _, nango, secret = await _resolve(environment)
@@ -442,7 +445,7 @@ async def delete_connection(
     environment: str,
     connection_id: str,
     provider_config_key: str,
-    confirmation: str,
+    confirmation: str = "",
 ) -> Any:
     """Delete one Nango connection."""
     _assert_confirmation(confirmation, DELETE_CONFIRMATION)
@@ -456,7 +459,7 @@ async def patch_connection_tags(
     connection_id: str,
     provider_config_key: str,
     tags: dict[str, str],
-    confirmation: str,
+    confirmation: str = "",
 ) -> Any:
     """Replace a connection's complete tag set. Fetch and merge first when changing one tag."""
     _assert_confirmation(confirmation, WRITE_CONFIRMATION)
@@ -547,7 +550,7 @@ async def create_reconnect_session(
     environment: str,
     connection_id: str,
     provider_config_key: str,
-    confirmation: str,
+    confirmation: str = "",
 ) -> Any:
     """Create a Nango reconnect session for an existing connection."""
     _assert_confirmation(confirmation, WRITE_CONFIRMATION)

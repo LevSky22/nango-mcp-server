@@ -38,6 +38,8 @@ class Settings:
     secret_resolver: str = "direct"
     metadata_namespace: str = DEFAULT_METADATA_NAMESPACE
     request_timeout: float = 20.0
+    read_only: bool = False
+    require_confirmation: bool = False
     infisical: InfisicalSettings | None = None
 
 
@@ -84,6 +86,13 @@ def _timeout(values: dict[str, str]) -> float:
         return float(raw)
     except ValueError:
         return 20.0
+
+
+def _bool(values: dict[str, str], name: str, *, default: bool = False) -> bool:
+    raw = _value(values, name)
+    if not raw:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _load_environments(values: dict[str, str], secret_resolver: str) -> tuple[EnvironmentConfig, ...]:
@@ -155,5 +164,7 @@ def load_settings() -> Settings:
             default=DEFAULT_METADATA_NAMESPACE,
         ),
         request_timeout=_timeout(file_values),
+        read_only=_bool(file_values, "NANGO_MCP_READ_ONLY"),
+        require_confirmation=_bool(file_values, "NANGO_MCP_REQUIRE_CONFIRMATION"),
         infisical=_load_infisical(file_values, secret_resolver),
     )

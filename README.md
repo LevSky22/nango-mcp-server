@@ -120,7 +120,11 @@ Optional settings:
 ```dotenv
 NANGO_MCP_REQUEST_TIMEOUT=20
 NANGO_MCP_METADATA_NAMESPACE=nango_mcp
+NANGO_MCP_READ_ONLY=false
+NANGO_MCP_REQUIRE_CONFIRMATION=false
 ```
+
+Set `NANGO_MCP_READ_ONLY=true` to block mutating tools. Set `NANGO_MCP_REQUIRE_CONFIRMATION=true` if you want write/delete tools to require an explicit confirmation phrase on every mutating call.
 
 ## Optional Infisical Resolver
 
@@ -213,21 +217,23 @@ For a multi-environment setup:
 Use the nango MCP server. List configured environments, check the prod environment, and list integrations in prod. Do not make write/delete calls.
 ```
 
-## Tool Notes
+## Tools
 
-Write operations require:
+This server exposes 23 tools grouped by workflow:
 
-```text
-I understand this changes the Nango environment
-```
+| Area | Tools | What they do |
+| --- | --- | --- |
+| Environment | `list_environments`, `check_environment` | Show configured Nango environments and verify a secret can be resolved without returning it. |
+| Integrations | `list_integrations`, `get_integration`, `search_provider_templates`, `create_integration`, `update_integration`, `delete_integration` | Inspect provider integrations, find Nango provider templates, and manage integration definitions. |
+| Connections | `list_connections`, `get_connection`, `get_connection_context`, `import_connection`, `delete_connection` | Inspect, summarize, import, or remove authorized provider connections. |
+| Tags and metadata | `patch_connection_tags`, `set_connection_metadata` | Maintain Nango connection tags and metadata for routing, attribution, and app configuration. |
+| Connect sessions | `create_connect_session`, `create_standard_connect_session`, `create_reconnect_session` | Create hosted Connect or reconnect links for users to authorize or repair provider access. |
+| Proxy | `proxy_request` | Call a provider API through Nango Proxy without exposing provider OAuth tokens to the agent. |
+| Conventions | `describe_connection_convention`, `build_connection_convention`, `apply_connection_convention`, `audit_connection_conventions` | Generate and audit optional tag/metadata conventions for cleaner multi-client operations. |
 
-Delete operations require:
+Read tools redact credential-like fields from Nango management API responses. Mutating tools are available by default; set `NANGO_MCP_READ_ONLY=true` for inspection-only installs, or enable `NANGO_MCP_REQUIRE_CONFIRMATION=true` if your deployment needs an extra phrase-based guard.
 
-```text
-I understand this deletes Nango configuration
-```
-
-`proxy_request` accepts provider-relative paths such as `/v1.0/me`; do not include `/proxy`.
+`proxy_request` accepts provider-relative paths such as `/v1.0/me`; do not include `/proxy`. It intentionally returns provider response data, because that is the requested data plane.
 
 ## Tags And Metadata
 

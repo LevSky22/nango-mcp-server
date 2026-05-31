@@ -50,3 +50,22 @@ def test_load_settings_requires_direct_secret(tmp_path, monkeypatch: pytest.Monk
 
     with pytest.raises(RuntimeError, match="NANGO_SECRET_KEY_PROD"):
         load_settings()
+
+
+def test_load_settings_supports_optional_mutation_guards(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "NANGO_SECRET_KEY=secret_default",
+                "NANGO_MCP_READ_ONLY=true",
+                "NANGO_MCP_REQUIRE_CONFIRMATION=true",
+            ]
+        )
+    )
+    monkeypatch.setenv("NANGO_MCP_ENV_FILE", str(env_file))
+
+    settings = load_settings()
+
+    assert settings.read_only is True
+    assert settings.require_confirmation is True
