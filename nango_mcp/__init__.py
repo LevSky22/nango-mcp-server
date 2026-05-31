@@ -1,0 +1,1 @@
+"""Nango MCP server package."""
