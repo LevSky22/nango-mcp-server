@@ -43,6 +43,8 @@ DELETE_CONFIRMATION = "I understand this deletes Nango configuration"
 
 OAUTH_AUTH_MODES = {"OAUTH1", "OAUTH2", "OAUTH2_CC"}
 CREDENTIAL_AUTH_MODES = {"API_KEY", "BASIC", "JWT", "SIGNATURE", "APP", "APP_STORE", "CUSTOM", "TWO_STEP"}
+TOP_LEVEL_SCOPE_FIELDS = ("scopes", "oauth_scopes", "default_scopes")
+REQUIRED_SCOPE_CREDENTIAL_FIELDS = ("client_id", "client_secret")
 
 FIELD_GUIDE = {
     "environment": "Configured Nango environment alias. Use 'default' for a single-key setup unless you renamed it.",
@@ -150,6 +152,103 @@ def _as_data_list(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(data, list):
         return []
     return [item for item in data if isinstance(item, dict)]
+
+
+def _as_data_dict(payload: Any) -> dict[str, Any]:
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    return data if isinstance(data, dict) else {}
+
+
+def _field_is_blank(value: Any) -> bool:
+    return value is None or value == ""
+
+
+def _integration_update_contains_scope_change(fields: dict[str, Any]) -> bool:
+    if any(key in fields for key in TOP_LEVEL_SCOPE_FIELDS):
+        return True
+    credentials = fields.get("credentials")
+    return isinstance(credentials, dict) and "scopes" in credentials
+
+
+def _normalized_scope_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value]
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _prepare_integration_update_fields(
+    fields: dict[str, Any],
+    current_integration: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Normalize Nango integration PATCH fields without exposing credential values."""
+    normalized = dict(fields)
+    notes: list[str] = []
+
+    credentials_value = normalized.get("credentials")
+    if credentials_value is not None and not isinstance(credentials_value, dict):
+        raise ValueError("credentials must be an object when patching a Nango integration")
+    credentials = dict(credentials_value or {})
+
+    top_level_scope_values: list[tuple[str, Any]] = []
+    for key in TOP_LEVEL_SCOPE_FIELDS:
+        if key in normalized:
+            top_level_scope_values.append((key, normalized.pop(key)))
+
+    if top_level_scope_values:
+        selected_name, selected_value = top_level_scope_values[0]
+        selected_normalized = _normalized_scope_value(selected_value)
+        for name, value in top_level_scope_values[1:]:
+            if _normalized_scope_value(value) != selected_normalized:
+                raise ValueError(
+                    "conflicting top-level scope fields supplied: "
+                    f"{selected_name} and {name}; pass one value under credentials.scopes"
+                )
+        if "scopes" in credentials and _normalized_scope_value(credentials["scopes"]) != selected_normalized:
+            raise ValueError("conflicting scope values supplied at top level and credentials.scopes")
+        credentials["scopes"] = selected_value
+        notes.append(
+            "Moved top-level scope field(s) into credentials.scopes; Nango rejects top-level "
+            "scopes/oauth_scopes/default_scopes on integration PATCH."
+        )
+
+    if "scopes" in credentials:
+        current = _as_data_dict(current_integration or {})
+        current_credentials = current.get("credentials")
+        if isinstance(current_credentials, dict):
+            merged_credentials = dict(current_credentials)
+            merged_credentials.update({key: value for key, value in credentials.items() if not _field_is_blank(value)})
+            credentials = merged_credentials
+
+        missing = [key for key in REQUIRED_SCOPE_CREDENTIAL_FIELDS if _field_is_blank(credentials.get(key))]
+        if missing:
+            missing_fields = ", ".join(f"credentials.{key}" for key in missing)
+            raise ValueError(
+                "scope updates must patch the complete Nango credentials object; "
+                f"missing {missing_fields}. Provide those credential fields or use an integration response "
+                "that includes credentials so the MCP can preserve them internally."
+            )
+
+        normalized["credentials"] = credentials
+        notes.append(
+            "OAuth scope updates affect the integration config only. Affected connections must reconnect/"
+            "reauthorize before their tokens carry the new scopes."
+        )
+    elif credentials_value is not None:
+        normalized["credentials"] = credentials
+
+    return normalized, notes
+
+
+def _connection_matches_integration(connection: dict[str, Any], integration_id: str) -> bool:
+    provider_config_key = (
+        connection.get("provider_config_key")
+        or connection.get("providerConfigKey")
+        or connection.get("integration_id")
+        or connection.get("integrationId")
+    )
+    return provider_config_key == integration_id
 
 
 def _provider_summary(provider: dict[str, Any]) -> dict[str, Any]:
@@ -329,11 +428,77 @@ async def create_integration(environment: str, payload: dict[str, Any], confirma
 
 
 @mcp.tool()
-async def update_integration(environment: str, integration_id: str, fields: dict[str, Any], confirmation: str = "") -> Any:
+async def update_integration(
+    environment: str,
+    integration_id: str,
+    fields: dict[str, Any],
+    confirmation: str = "",
+    reconnect_connection_ids: list[str] | None = None,
+    auto_reconnect_single_matching_connection: bool = True,
+) -> Any:
     """Patch a Nango integration."""
     _assert_confirmation(confirmation, WRITE_CONFIRMATION)
     _, nango, secret = await _resolve(environment)
-    return sanitize_response(await nango.update_integration(secret.nango_secret_key, integration_id, fields))
+    scope_change = _integration_update_contains_scope_change(fields)
+    current_integration = None
+    if scope_change:
+        current_integration = await nango.get_integration(
+            secret.nango_secret_key,
+            integration_id,
+            include_credentials=True,
+        )
+    prepared_fields, operator_notes = _prepare_integration_update_fields(fields, current_integration)
+    response = sanitize_response(await nango.update_integration(secret.nango_secret_key, integration_id, prepared_fields))
+    if scope_change and not reconnect_connection_ids and auto_reconnect_single_matching_connection:
+        connections_payload = await nango.list_connections(secret.nango_secret_key)
+        matching_connections = [
+            connection for connection in _as_data_list(connections_payload)
+            if _connection_matches_integration(connection, integration_id)
+        ]
+        if len(matching_connections) == 1:
+            reconnect_connection_ids = [
+                matching_connections[0].get("connection_id")
+                or matching_connections[0].get("connectionId")
+                or ""
+            ]
+            reconnect_connection_ids = [connection_id for connection_id in reconnect_connection_ids if connection_id]
+        elif len(matching_connections) > 1:
+            operator_notes.append(
+                f"Found {len(matching_connections)} connections for integration {integration_id}; "
+                "no reconnect sessions were created automatically. Pass reconnect_connection_ids for the affected accounts."
+            )
+        else:
+            operator_notes.append(
+                f"No existing connections were found for integration {integration_id}; no reconnect session was created."
+            )
+
+    reconnect_sessions: list[dict[str, Any]] = []
+    if scope_change and reconnect_connection_ids:
+        for connection_id in reconnect_connection_ids:
+            reconnect_sessions.append(
+                {
+                    "connection_id": connection_id,
+                    "response": sanitize_response(
+                        await nango.create_reconnect_session(
+                            secret.nango_secret_key,
+                            connection_id=connection_id,
+                            integration_id=integration_id,
+                        )
+                    ),
+                }
+            )
+        operator_notes.append("Created reconnect session(s) for supplied or inferred affected connection id(s).")
+    elif scope_change:
+        operator_notes.append(
+            "No reconnect session was created. Pass reconnect_connection_ids when you want the MCP to create "
+            "reconnect sessions after the scope patch."
+        )
+
+    if operator_notes and isinstance(response, dict):
+        response["_nango_mcp_operator_notes"] = operator_notes
+    if reconnect_sessions and isinstance(response, dict):
+        response["_nango_mcp_reconnect_sessions"] = reconnect_sessions
+    return response
 
 
 @mcp.tool()

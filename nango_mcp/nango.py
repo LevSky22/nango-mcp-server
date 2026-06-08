@@ -148,7 +148,7 @@ class NangoClient:
             secret_key,
             "GET",
             f"/integrations/{integration_id}",
-            params={"include_credentials": "true"} if include_credentials else None,
+            params={"include": "credentials"} if include_credentials else None,
         )
 
     async def create_integration(self, secret_key: str, payload: dict[str, Any]) -> Any:

@@ -55,6 +55,24 @@ class ConnectSessionNangoClient(CapturingNangoClient):
 
 
 @pytest.mark.asyncio
+async def test_get_integration_includes_credentials_with_current_nango_query_shape() -> None:
+    client = CapturingNangoClient()
+
+    await client.get_integration("nango-secret", "zoho-crm", include_credentials=True)
+
+    assert client.calls == [
+        {
+            "secret_key": "nango-secret",
+            "method": "GET",
+            "path": "/integrations/zoho-crm",
+            "params": {"include": "credentials"},
+            "body": None,
+            "headers": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_set_connection_metadata_uses_documented_body_shape() -> None:
     client = CapturingNangoClient()
 

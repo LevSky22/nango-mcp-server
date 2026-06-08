@@ -233,6 +233,8 @@ This server exposes 23 tools grouped by workflow:
 
 Read tools redact credential-like fields from Nango management API responses. Mutating tools are available by default; set `NANGO_MCP_READ_ONLY=true` for inspection-only installs, or enable `NANGO_MCP_REQUIRE_CONFIRMATION=true` if your deployment needs an extra phrase-based guard.
 
+When using `update_integration` to change OAuth scopes, pass scopes under `credentials.scopes`. The MCP also accepts top-level `scopes`, `oauth_scopes`, or `default_scopes` as operator-friendly aliases and normalizes them into the official Nango payload shape. Scope updates preserve existing integration credential fields internally when Nango returns them through `include=credentials`; if those values are unavailable, provide the credential fields in the request. By default, the MCP auto-creates a reconnect session when exactly one existing connection matches the updated integration. Pass `reconnect_connection_ids` when the affected connection ids are known or when an integration has multiple connections.
+
 `proxy_request` accepts provider-relative paths such as `/v1.0/me`; do not include `/proxy`. It intentionally returns provider response data, because that is the requested data plane.
 
 ## Tags And Metadata
