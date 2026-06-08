@@ -251,6 +251,8 @@ The optional convention helpers can generate tags and metadata under `metadata.n
 
 ## Development
 
+Source code lives in `src/nango_mcp/`: the public package/CLI name uses hyphens (`nango-mcp`), while the Python import package uses underscores (`nango_mcp`). The root `server.py` is only a source-checkout launcher; installed MCP clients should use the `nango-mcp` console script.
+
 ```bash
 python -m pytest -q
 ```
