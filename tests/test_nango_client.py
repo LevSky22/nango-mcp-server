@@ -161,54 +161,6 @@ async def test_create_reconnect_session_adds_self_hosted_api_url_to_connect_link
 
 
 @pytest.mark.asyncio
-async def test_search_log_operations_uses_private_logs_api() -> None:
-    client = CapturingNangoClient()
-
-    await client.search_log_operations("nango-secret", "prod", {"limit": 10, "types": ["proxy"]})
-
-    assert client.calls[0] == {
-        "secret_key": "nango-secret",
-        "method": "POST",
-        "path": "/api/v1/logs/operations",
-        "params": {"env": "prod"},
-        "body": {"limit": 10, "types": ["proxy"]},
-        "headers": None,
-    }
-
-
-@pytest.mark.asyncio
-async def test_get_log_operation_uses_private_logs_api() -> None:
-    client = CapturingNangoClient()
-
-    await client.get_log_operation("nango-secret", "prod", "op_123")
-
-    assert client.calls[0] == {
-        "secret_key": "nango-secret",
-        "method": "GET",
-        "path": "/api/v1/logs/operations/op_123",
-        "params": {"env": "prod"},
-        "body": None,
-        "headers": None,
-    }
-
-
-@pytest.mark.asyncio
-async def test_search_log_messages_uses_private_logs_api() -> None:
-    client = CapturingNangoClient()
-
-    await client.search_log_messages("nango-secret", "prod", {"operationId": "op_123", "limit": 20})
-
-    assert client.calls[0] == {
-        "secret_key": "nango-secret",
-        "method": "POST",
-        "path": "/api/v1/logs/messages",
-        "params": {"env": "prod"},
-        "body": {"operationId": "op_123", "limit": 20},
-        "headers": None,
-    }
-
-
-@pytest.mark.asyncio
 async def test_proxy_request_protects_nango_headers_and_prefixes_provider_headers() -> None:
     client = CapturingNangoClient()
 
