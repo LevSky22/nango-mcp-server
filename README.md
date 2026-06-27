@@ -237,6 +237,8 @@ When using `update_integration` to change OAuth scopes, pass scopes under `crede
 
 `proxy_request` accepts provider-relative paths such as `/v1.0/me`; do not include `/proxy`. It intentionally returns provider response data, because that is the requested data plane.
 
+For Nango Proxy calls that need a provider host override, pass `base_url_override` to `proxy_request`. The server forwards it as Nango's raw `base-url-override` control header. Ordinary provider headers still belong in `headers` and are forwarded as `nango-proxy-*` headers. This matters for provider families where one connection can call multiple hosts, such as a generic Google integration calling `sheets.googleapis.com` instead of its default Google API host.
+
 ## Tags And Metadata
 
 This project follows Nango's public guidance:

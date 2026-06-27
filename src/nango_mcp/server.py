@@ -738,6 +738,7 @@ async def proxy_request(
     path: str,
     query: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
+    base_url_override: str | None = None,
     body: Any | None = None,
 ) -> str:
     """Call a provider API through the Nango Proxy without exposing provider tokens."""
@@ -750,6 +751,7 @@ async def proxy_request(
         path,
         query=query,
         headers=headers,
+        base_url_override=base_url_override,
         body=body,
     )
     return json_response_text(response)

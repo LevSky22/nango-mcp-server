@@ -233,6 +233,7 @@ class NangoClient:
         *,
         query: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        base_url_override: str | None = None,
         body: Any | None = None,
     ) -> Any:
         normalized_method = method.upper().strip()
@@ -248,8 +249,14 @@ class NangoClient:
             lower = key.lower()
             if lower in {"authorization", "provider-config-key", "connection-id"}:
                 continue
-            header_name = key if lower.startswith("nango-proxy-") else f"nango-proxy-{key}"
+            header_name = (
+                key
+                if lower in {"base-url-override"} or lower.startswith("nango-proxy-")
+                else f"nango-proxy-{key}"
+            )
             proxy_headers[header_name] = value
+        if base_url_override:
+            proxy_headers["base-url-override"] = base_url_override
 
         clean_path = path.lstrip("/")
         response = await self._send(

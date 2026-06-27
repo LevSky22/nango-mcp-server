@@ -41,9 +41,11 @@ def test_as_data_list_accepts_wrapped_or_raw_lists() -> None:
 async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"value": [{"subject": "Quote request", "from": {"emailAddress": {"address": "lead@example.test"}}}]}
     envelope = {"ok": True, "status": 200, "content_type": "application/json", "response_headers": {}, "response": payload}
+    calls = []
 
     class FakeNango:
         async def proxy_request(self, *args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
             return envelope
 
     async def fake_resolve(environment: str):
@@ -63,6 +65,7 @@ async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: 
     assert json.loads(text) == envelope
     assert '"status": 200' in text
     assert '"value": [' in text
+    assert calls[0]["kwargs"]["base_url_override"] is None
 
     mcp_result = await server.mcp.call_tool(
         "proxy_request",
@@ -72,7 +75,9 @@ async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: 
             "connection_id": "service",
             "method": "GET",
             "path": "/v1.0/me/messages",
+            "base_url_override": "https://graph.microsoft.com",
         },
     )
     assert isinstance(mcp_result, list)
     assert json.loads(mcp_result[0].text) == envelope
+    assert calls[1]["kwargs"]["base_url_override"] == "https://graph.microsoft.com"

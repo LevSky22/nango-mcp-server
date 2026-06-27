@@ -183,6 +183,29 @@ async def test_proxy_request_protects_nango_headers_and_prefixes_provider_header
 
 
 @pytest.mark.asyncio
+async def test_proxy_request_forwards_base_url_override_as_raw_proxy_header() -> None:
+    client = CapturingNangoClient()
+
+    await client.proxy_request(
+        "nango-secret",
+        "google",
+        "service",
+        "GET",
+        "/v4/spreadsheets/sheet-id/values/A1",
+        headers={"base-url-override": "https://ignored.example.test", "Accept": "application/json"},
+        base_url_override="https://sheets.googleapis.com",
+    )
+
+    assert client.calls[0]["headers"] == {
+        "Provider-Config-Key": "google",
+        "Connection-Id": "service",
+        "nango-proxy-accept": "application/json",
+        "base-url-override": "https://sheets.googleapis.com",
+        "nango-proxy-Accept": "application/json",
+    }
+
+
+@pytest.mark.asyncio
 async def test_proxy_request_returns_http_envelope() -> None:
     client = CapturingNangoClient()
 
