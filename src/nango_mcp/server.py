@@ -120,6 +120,96 @@ def json_response_text(value: Any) -> str:
     return json.dumps(value, indent=2, ensure_ascii=False, default=str)
 
 
+def _bounded_limit(limit: int, *, default: int, maximum: int = 500) -> int:
+    value = default if limit is None else int(limit)
+    if value < 1 or value > maximum:
+        raise ValueError(f"limit must be between 1 and {maximum}")
+    return value
+
+
+def _strip_none(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if item is not None}
+
+
+def _compact_url(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return value.split("?", 1)[0] + "?..." if "?" in value else value
+
+
+def _compact_log_operation(operation: Any) -> Any:
+    if not isinstance(operation, dict):
+        return operation
+    keys = (
+        "id",
+        "createdAt",
+        "endedAt",
+        "durationMs",
+        "level",
+        "state",
+        "message",
+        "operation",
+        "providerName",
+        "integrationName",
+        "connectionName",
+        "endUserId",
+        "syncConfigName",
+    )
+    return {key: operation.get(key) for key in keys if key in operation}
+
+
+def _compact_log_message(message: Any) -> Any:
+    if not isinstance(message, dict):
+        return message
+    compact = {
+        key: message.get(key)
+        for key in (
+            "id",
+            "parentId",
+            "createdAt",
+            "endedAt",
+            "durationMs",
+            "level",
+            "type",
+            "context",
+            "message",
+        )
+        if key in message
+    }
+    error = message.get("error")
+    if isinstance(error, dict):
+        compact["error"] = {key: error.get(key) for key in ("name", "message", "type") if key in error}
+    request = message.get("request")
+    if isinstance(request, dict):
+        compact["request"] = {
+            key: _compact_url(request.get(key)) if key == "url" else request.get(key)
+            for key in ("method", "url")
+            if key in request
+        }
+    response = message.get("response")
+    if isinstance(response, dict):
+        compact["response"] = {key: response.get(key) for key in ("code",) if key in response}
+    retry = message.get("retry")
+    if isinstance(retry, dict):
+        compact["retry"] = {key: retry.get(key) for key in ("attempt", "max", "waited") if key in retry}
+    return compact
+
+
+def _compact_log_response(value: Any, *, kind: str, include_raw: bool) -> Any:
+    sanitized = sanitize_response(value)
+    if include_raw or not isinstance(sanitized, dict):
+        return sanitized
+
+    data = sanitized.get("data")
+    if isinstance(data, list):
+        compact_fn = _compact_log_message if kind == "messages" else _compact_log_operation
+        return {**sanitized, "data": [compact_fn(item) for item in data]}
+    if isinstance(data, dict):
+        compact_fn = _compact_log_message if kind == "messages" else _compact_log_operation
+        return {**sanitized, "data": compact_fn(data)}
+    return sanitized
+
+
 def _collect_scope_context(value: Any, path: str = "", depth: int = 0) -> dict[str, Any]:
     if depth > 8:
         return {}
@@ -727,6 +817,80 @@ async def create_reconnect_session(
             integration_id=provider_config_key,
         )
     )
+
+
+@mcp.tool()
+async def search_log_operations(
+    environment: str,
+    search: str | None = None,
+    limit: int = 50,
+    states: list[str] | None = None,
+    types: list[str] | None = None,
+    integrations: list[str] | None = None,
+    connections: list[str] | None = None,
+    syncs: list[str] | None = None,
+    period: dict[str, str] | None = None,
+    cursor: str | None = None,
+    include_raw: bool = False,
+) -> Any:
+    """Search Nango log operations for an environment."""
+    _, nango, secret = await _resolve(environment)
+    body = _strip_none(
+        {
+            "search": search,
+            "limit": _bounded_limit(limit, default=50),
+            "states": states,
+            "types": types,
+            "integrations": integrations,
+            "connections": connections,
+            "syncs": syncs,
+            "period": period,
+            "cursor": cursor,
+        }
+    )
+    response = await nango.search_log_operations(secret.nango_secret_key, secret.environment, body)
+    return _compact_log_response(response, kind="operations", include_raw=include_raw)
+
+
+@mcp.tool()
+async def get_log_operation(
+    environment: str,
+    operation_id: str,
+    include_raw: bool = False,
+) -> Any:
+    """Get one Nango log operation by operation id."""
+    _, nango, secret = await _resolve(environment)
+    response = await nango.get_log_operation(secret.nango_secret_key, secret.environment, operation_id)
+    return _compact_log_response(response, kind="operations", include_raw=include_raw)
+
+
+@mcp.tool()
+async def search_log_messages(
+    environment: str,
+    operation_id: str,
+    search: str | None = None,
+    limit: int = 100,
+    states: list[str] | None = None,
+    period: dict[str, str] | None = None,
+    cursor_before: str | None = None,
+    cursor_after: str | None = None,
+    include_raw: bool = False,
+) -> Any:
+    """Search detailed Nango log messages under one operation."""
+    _, nango, secret = await _resolve(environment)
+    body = _strip_none(
+        {
+            "operationId": operation_id,
+            "search": search,
+            "limit": _bounded_limit(limit, default=100),
+            "states": states,
+            "period": period,
+            "cursorBefore": cursor_before,
+            "cursorAfter": cursor_after,
+        }
+    )
+    response = await nango.search_log_messages(secret.nango_secret_key, secret.environment, body)
+    return _compact_log_response(response, kind="messages", include_raw=include_raw)
 
 
 @mcp.tool(structured_output=False)

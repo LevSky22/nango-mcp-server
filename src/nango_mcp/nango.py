@@ -223,6 +223,32 @@ class NangoClient:
         response = await self._request(secret_key, "POST", "/connect/sessions/reconnect", body=body)
         return self._normalize_connect_session_response(response)
 
+    async def search_log_operations(self, secret_key: str, environment: str, body: dict[str, Any]) -> Any:
+        return await self._request(
+            secret_key,
+            "POST",
+            "/api/v1/logs/operations",
+            params={"env": environment},
+            body=body,
+        )
+
+    async def get_log_operation(self, secret_key: str, environment: str, operation_id: str) -> Any:
+        return await self._request(
+            secret_key,
+            "GET",
+            f"/api/v1/logs/operations/{operation_id}",
+            params={"env": environment},
+        )
+
+    async def search_log_messages(self, secret_key: str, environment: str, body: dict[str, Any]) -> Any:
+        return await self._request(
+            secret_key,
+            "POST",
+            "/api/v1/logs/messages",
+            params={"env": environment},
+            body=body,
+        )
+
     async def proxy_request(
         self,
         secret_key: str,

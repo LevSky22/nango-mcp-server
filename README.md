@@ -228,6 +228,7 @@ This server exposes 23 tools grouped by workflow:
 | Connections | `list_connections`, `get_connection`, `get_connection_context`, `import_connection`, `delete_connection` | Inspect, summarize, import, or remove authorized provider connections. |
 | Tags and metadata | `patch_connection_tags`, `set_connection_metadata` | Maintain Nango connection tags and metadata for routing, attribution, and app configuration. |
 | Connect sessions | `create_connect_session`, `create_standard_connect_session`, `create_reconnect_session` | Create hosted Connect or reconnect links for users to authorize or repair provider access. |
+| Logs | `search_log_operations`, `get_log_operation`, `search_log_messages` | Inspect Nango Logs operations and messages through Nango's logs API. |
 | Proxy | `proxy_request` | Call a provider API through Nango Proxy without exposing provider OAuth tokens to the agent. |
 | Conventions | `describe_connection_convention`, `build_connection_convention`, `apply_connection_convention`, `audit_connection_conventions` | Generate and audit optional tag/metadata conventions for cleaner multi-client operations. |
 
@@ -236,6 +237,8 @@ Read tools redact credential-like fields from Nango management API responses. Mu
 When using `update_integration` to change OAuth scopes, pass scopes under `credentials.scopes`. The MCP also accepts top-level `scopes`, `oauth_scopes`, or `default_scopes` as operator-friendly aliases and normalizes them into the official Nango payload shape. Scope updates preserve existing integration credential fields internally when Nango returns them through `include=credentials`; if those values are unavailable, provide the credential fields in the request. By default, the MCP auto-creates a reconnect session when exactly one existing connection matches the updated integration. Pass `reconnect_connection_ids` when the affected connection ids are known or when an integration has multiple connections.
 
 `proxy_request` accepts provider-relative paths such as `/v1.0/me`; do not include `/proxy`. It intentionally returns provider response data, because that is the requested data plane.
+
+Log tools call Nango's own `/api/v1/logs/*` API, not Elasticsearch directly. They return compact summaries by default because log messages can contain provider payloads, URLs, headers, and error bodies; pass `include_raw=true` only when the detailed sanitized log document is needed.
 
 For Nango Proxy calls that need a provider host override, pass `base_url_override` to `proxy_request`. The server forwards it as Nango's raw `base-url-override` control header. Ordinary provider headers still belong in `headers` and are forwarded as `nango-proxy-*` headers. This matters for provider families where one connection can call multiple hosts, such as a generic Google integration calling `sheets.googleapis.com` instead of its default Google API host.
 
