@@ -216,7 +216,22 @@ Rate-limit handling distinguishes Nango gateway throttles from forwarded provide
 
 ## Tools
 
-The server exposes 26 tools across environment discovery, provider templates, integrations, connections, Connect sessions, metadata conventions, proxy access, artifact queries, and provider downloads. Management responses redact credential-like fields. `refresh_connection_credentials` returns only a non-secret summary.
+The server exposes 26 tools, grouped by workflow:
+
+| Area | Tools | Access |
+| --- | --- | --- |
+| Environments | `list_environments`, `check_environment` | Read |
+| Provider discovery | `search_provider_templates`, `download_provider_file` | Read |
+| Integrations | `list_integrations`, `get_integration`, `create_integration`, `update_integration`, `delete_integration` | Read/write |
+| Connections | `list_connections`, `get_connection`, `get_connection_context`, `refresh_connection_credentials`, `import_connection`, `delete_connection` | Read/write |
+| Tags and metadata | `patch_connection_tags`, `set_connection_metadata` | Write |
+| Connect sessions | `create_connect_session`, `create_standard_connect_session`, `create_reconnect_session` | Write |
+| Provider API and large responses | `proxy_request`, `query_response_artifact` | Read/write |
+| Optional connection conventions | `describe_connection_convention`, `build_connection_convention`, `apply_connection_convention`, `audit_connection_conventions` | Read/write |
+
+See the [complete tool reference](https://github.com/LevSky22/nango-mcp-server/blob/main/docs/tools.md) for each tool's purpose, important inputs, result behavior, and safety notes. The MCP `tools/list` schema remains authoritative for exact input types and required fields.
+
+Management responses redact credential-like fields. `refresh_connection_credentials` returns only a non-secret summary. Non-GET/HEAD proxy requests and all other mutations follow the approval policy described above.
 
 The connection convention helpers are optional. They generate generic Nango tags and metadata; they are not profiles and do not discover organizations or impose deployment-specific policy.
 
