@@ -8,6 +8,7 @@ from typing import Any
 
 import uvicorn
 from mcp.server import MCPServer
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -34,6 +35,7 @@ from .conventions import (
     imported_connection_id,
 )
 from .nango import NangoClient
+from .oauth import OAuthIntrospectionVerifier, caller_scope_from_access_token
 from .secrets import ResolvedNangoSecret, SecretResolver, build_secret_resolver
 
 
@@ -1057,17 +1059,62 @@ class BearerScopeMiddleware:
             )
 
 
+class OAuthScopeMiddleware:
+    """Bind validated OAuth claims to the same environment policy as static auth."""
+
+    def __init__(self, app: ASGIApp, verifier: OAuthIntrospectionVerifier) -> None:
+        self.app = app
+        self.verifier = verifier
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") == "/health":
+            await self.app(scope, receive, send)
+            return
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        authorization = headers.get("authorization", "")
+        if not authorization.startswith("Bearer "):
+            await Response(status_code=401)(scope, receive, send)
+            return
+        access_token = await self.verifier.verify_token(authorization[7:].strip())
+        if access_token is None:
+            await Response(status_code=401)(scope, receive, send)
+            return
+        try:
+            caller = caller_scope_from_access_token(access_token)
+        except PermissionError:
+            await Response(status_code=403)(scope, receive, send)
+            return
+        scope_token = set_scope(caller)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_scope(scope_token)
+
+
 def create_http_app(
     settings: Settings,
     registry: TokenRegistry | TokenRegistrySource | None = None,
 ) -> ASGIApp:
-    if settings.auth_mode != "static":
-        raise RuntimeError("OAuth HTTP authentication is configured by the OAuth resource-server adapter")
-    resolved_registry = registry or TokenRegistrySource(
-        settings.token_registry_raw,
-        settings.denied_environments,
-        settings.token_registry_file,
-    )
+    oauth_verifier: OAuthIntrospectionVerifier | None = None
+    if settings.auth_mode == "oauth":
+        if settings.oauth is None:
+            raise RuntimeError("OAuth settings are unavailable")
+        oauth_verifier = OAuthIntrospectionVerifier(settings.oauth)
+        mcp.settings.auth = AuthSettings(
+            issuer_url=settings.oauth.issuer_url,
+            resource_server_url=settings.oauth.resource_url,
+            required_scopes=list(settings.oauth.required_scopes),
+        )
+        mcp._token_verifier = oauth_verifier  # type: ignore[attr-defined]
+    else:
+        resolved_registry = registry or TokenRegistrySource(
+            settings.token_registry_raw,
+            settings.denied_environments,
+            settings.token_registry_file,
+        )
 
     @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
     async def health(_: Request) -> Response:
@@ -1083,6 +1130,8 @@ def create_http_app(
         ),
         host=settings.http_host,
     )
+    if oauth_verifier is not None:
+        return OAuthScopeMiddleware(app, oauth_verifier)
     return BearerScopeMiddleware(app, resolved_registry)
 
 

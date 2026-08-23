@@ -78,3 +78,25 @@ def test_http_static_auth_requires_a_token_registry(tmp_path, monkeypatch: pytes
 
     with pytest.raises(RuntimeError, match="TOKEN"):
         load_settings()
+
+
+def test_http_oauth_loads_resource_server_settings(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "NANGO_SECRET_KEY=secret_default",
+                "NANGO_MCP_TRANSPORT=http",
+                "NANGO_MCP_AUTH_MODE=oauth",
+                "NANGO_MCP_OAUTH_ISSUER_URL=https://identity.example.test",
+                "NANGO_MCP_OAUTH_RESOURCE_URL=https://mcp.example.test/mcp",
+                "NANGO_MCP_OAUTH_INTROSPECTION_URL=https://identity.example.test/oauth/introspect",
+                "NANGO_MCP_OAUTH_CLIENT_ID=resource-server",
+                "NANGO_MCP_OAUTH_CLIENT_SECRET=test-secret",
+            ]
+        )
+    )
+    monkeypatch.setenv("NANGO_MCP_ENV_FILE", str(env_file))
+    settings = load_settings()
+    assert settings.oauth is not None
+    assert settings.oauth.resource_url == "https://mcp.example.test/mcp"

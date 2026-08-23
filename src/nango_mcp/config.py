@@ -35,6 +35,16 @@ class InfisicalSettings:
 
 
 @dataclass(frozen=True)
+class OAuthSettings:
+    issuer_url: str
+    resource_url: str
+    introspection_url: str
+    client_id: str
+    client_secret: str
+    required_scopes: tuple[str, ...] = ("nango-mcp",)
+
+
+@dataclass(frozen=True)
 class Settings:
     nango_url: str
     environments: tuple[EnvironmentConfig, ...]
@@ -60,6 +70,7 @@ class Settings:
     denied_environments: frozenset[str] = frozenset()
     request_state_keys: tuple[str, ...] = ()
     request_state_ttl_seconds: int = DEFAULT_REQUEST_STATE_TTL_SECONDS
+    oauth: OAuthSettings | None = None
 
 
 def env_key_for_slug(slug: str) -> str:
@@ -184,6 +195,42 @@ def _load_infisical(values: dict[str, str], secret_resolver: str) -> InfisicalSe
     return settings
 
 
+def _load_oauth(values: dict[str, str], transport: str, auth_mode: str) -> OAuthSettings | None:
+    if transport != "http" or auth_mode != "oauth":
+        return None
+    settings = OAuthSettings(
+        issuer_url=_value(values, "NANGO_MCP_OAUTH_ISSUER_URL").rstrip("/"),
+        resource_url=_value(values, "NANGO_MCP_OAUTH_RESOURCE_URL").rstrip("/"),
+        introspection_url=_value(values, "NANGO_MCP_OAUTH_INTROSPECTION_URL"),
+        client_id=_value(values, "NANGO_MCP_OAUTH_CLIENT_ID"),
+        client_secret=_value(values, "NANGO_MCP_OAUTH_CLIENT_SECRET"),
+        required_scopes=_csv(
+            _value(values, "NANGO_MCP_OAUTH_REQUIRED_SCOPES", default="nango-mcp")
+        ),
+    )
+    missing = [
+        name
+        for name, value in {
+            "NANGO_MCP_OAUTH_ISSUER_URL": settings.issuer_url,
+            "NANGO_MCP_OAUTH_RESOURCE_URL": settings.resource_url,
+            "NANGO_MCP_OAUTH_INTROSPECTION_URL": settings.introspection_url,
+            "NANGO_MCP_OAUTH_CLIENT_ID": settings.client_id,
+            "NANGO_MCP_OAUTH_CLIENT_SECRET": settings.client_secret,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Missing OAuth resource-server settings: {', '.join(missing)}")
+    for name, value in (
+        ("NANGO_MCP_OAUTH_ISSUER_URL", settings.issuer_url),
+        ("NANGO_MCP_OAUTH_RESOURCE_URL", settings.resource_url),
+        ("NANGO_MCP_OAUTH_INTROSPECTION_URL", settings.introspection_url),
+    ):
+        if not value.startswith("https://") and not value.startswith("http://127.0.0.1") and not value.startswith("http://localhost"):
+            raise RuntimeError(f"{name} must use HTTPS except for loopback development")
+    return settings
+
+
 def load_settings() -> Settings:
     env_file = os.getenv("NANGO_MCP_ENV_FILE", ".env")
     file_values = _read_env_file(env_file)
@@ -249,4 +296,5 @@ def load_settings() -> Settings:
         ),
         request_state_keys=request_state_keys,
         request_state_ttl_seconds=request_state_ttl,
+        oauth=_load_oauth(file_values, transport, auth_mode),
     )
