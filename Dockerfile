@@ -1,11 +1,11 @@
-FROM python:3.13-slim AS build
+FROM python:3.13-alpine AS build
 WORKDIR /build
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels .
 
-FROM python:3.13-slim
-RUN useradd --create-home --uid 10001 nango-mcp
+FROM python:3.13-alpine
+RUN adduser -D -u 10001 nango-mcp
 COPY --from=build /wheels /wheels
 RUN python -m pip install --no-cache-dir /wheels/* && rm -rf /wheels
 USER nango-mcp
