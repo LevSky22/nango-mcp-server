@@ -1,23 +1,37 @@
 [project]
 name = "nango-mcp-server"
-version = "0.1.0"
+version = "1.0.0"
 description = "Open-source MCP server for managing Nango environments, integrations, connections, Connect sessions, and proxy requests"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "Lev Jampolsky" },
   { name = "ValStratis" },
 ]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
 dependencies = [
   "httpx>=0.28.1,<1",
-  "mcp>=1.27.2,<2",
+  "mcp>=2,<3",
+  "uvicorn>=0.47,<1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/LevSky22/nango-mcp-server"
+Repository = "https://github.com/LevSky22/nango-mcp-server"
+Issues = "https://github.com/LevSky22/nango-mcp-server/issues"
 
 [project.optional-dependencies]
 test = [
   "pytest>=8,<9",
-  "pytest-asyncio>=0.23,<1",
+  "pytest-asyncio>=1,<2",
 ]
 
 [project.scripts]

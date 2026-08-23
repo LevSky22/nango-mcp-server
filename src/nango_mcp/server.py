@@ -2,10 +2,50 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+import os
+import re
+import secrets
+import hashlib
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+import uvicorn
+from mcp.server import MCPServer
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.context import ServerRequestContext
+from mcp.server.mcpserver import Context
+from mcp.server.request_state import RequestStateBoundary, RequestStateSecurity
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp_types import (
+    CallToolResult,
+    ElicitRequest,
+    ElicitRequestFormParams,
+    ElicitResult,
+    InputRequiredResult,
+    ResourceLink,
+    TextContent,
+)
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+from pydantic import BaseModel, Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .auth import (
+    CallerScope,
+    TokenRegistry,
+    TokenRegistrySource,
+    authenticate,
+    authorize_operation,
+    permitted_environments,
+    proxy_route_matches,
+    require_scope,
+    reset_scope,
+    set_scope,
+)
+from .binary_resources import BinaryResourceStore
 from .config import Settings, load_settings
 from .conventions import (
     SUGGESTED_OAUTH_APP_OWNERS,
@@ -17,6 +57,9 @@ from .conventions import (
     imported_connection_id,
 )
 from .nango import NangoClient
+from .oauth import OAuthIntrospectionVerifier, caller_scope_from_access_token
+from .ratelimit import EnvironmentConcurrencyGate, current_environment
+from .response_safety import ArtifactStore, bound_proxy_response
 from .secrets import ResolvedNangoSecret, SecretResolver, build_secret_resolver
 
 
@@ -38,9 +81,6 @@ SECRET_KEY_FRAGMENTS = (
     "token",
 )
 
-WRITE_CONFIRMATION = "I understand this changes the Nango environment"
-DELETE_CONFIRMATION = "I understand this deletes Nango configuration"
-
 OAUTH_AUTH_MODES = {"OAUTH1", "OAUTH2", "OAUTH2_CC"}
 CREDENTIAL_AUTH_MODES = {"API_KEY", "BASIC", "JWT", "SIGNATURE", "APP", "APP_STORE", "CUSTOM", "TWO_STEP"}
 TOP_LEVEL_SCOPE_FIELDS = ("scopes", "oauth_scopes", "default_scopes")
@@ -58,43 +98,100 @@ FIELD_GUIDE = {
 }
 
 
-mcp = FastMCP(
+_state_keys = [
+    key.strip()
+    for key in os.getenv("NANGO_MCP_REQUEST_STATE_KEYS", "").split(",")
+    if key.strip()
+] or [secrets.token_urlsafe(32)]
+
+
+def _request_state_principal(_: ServerRequestContext[Any, Any]) -> str:
+    caller = require_scope()
+    policy = {
+        "label": caller.label,
+        "environments": sorted(caller.environments),
+        "mutationApproval": caller.mutation_approval,
+    }
+    digest = hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return f"{caller.label}:{digest}"
+
+
+class ToolPolicyMiddleware:
+    """Enforce caller tool denials before argument validation or handler execution."""
+
+    async def __call__(self, ctx: ServerRequestContext[Any, Any], call_next: Any) -> Any:
+        if ctx.method == "tools/call":
+            params = ctx.params
+            name = getattr(params, "name", None)
+            if name is None and isinstance(params, dict):
+                name = params.get("name")
+            if isinstance(name, str):
+                authorize_operation(require_scope(), name)
+        return await call_next(ctx)
+
+
+mcp = MCPServer(
     name="Nango MCP Server",
+    version="1.0.0",
     instructions=(
         "Operate one or more Nango environments through the Nango REST API and Proxy. "
         "The default resolver reads Nango secret keys from environment variables or a .env file; "
         "Infisical is optional."
     ),
+    request_state_security=RequestStateSecurity(
+        keys=_state_keys,
+        ttl=15 * 60,
+        bind_principal=_request_state_principal,
+    ),
+    middleware=[ToolPolicyMiddleware()],
 )
 
 _settings: Settings | None = None
 _resolver: SecretResolver | None = None
 _nango: NangoClient | None = None
+_environment_gate: EnvironmentConcurrencyGate | None = None
 
 
 def _runtime() -> tuple[Settings, SecretResolver, NangoClient]:
-    global _settings, _resolver, _nango
+    global _settings, _resolver, _nango, _environment_gate
     if _settings is None:
         _settings = load_settings()
     if _resolver is None:
         _resolver = build_secret_resolver(_settings)
     if _nango is None:
-        _nango = NangoClient(_settings.nango_url, timeout=_settings.request_timeout)
+        _nango = NangoClient(
+            _settings.nango_url,
+            timeout=_settings.request_timeout,
+            public_base_url=_settings.public_nango_url,
+            rate_limit_max_attempts=_settings.rate_limit_max_attempts,
+            rate_limit_max_wait=_settings.rate_limit_max_wait_seconds,
+            rate_limit_backoff_base=_settings.rate_limit_backoff_base_seconds,
+            rate_limit_ceiling=_settings.rate_limit_retry_ceiling_seconds,
+            max_connections=_settings.http_max_connections,
+            max_keepalive=_settings.http_max_keepalive,
+        )
+    if _environment_gate is None:
+        _environment_gate = EnvironmentConcurrencyGate(
+            _settings.environment_max_concurrency,
+            _settings.environment_acquire_timeout_seconds,
+        )
     return _settings, _resolver, _nango
 
 
 async def _resolve(environment: str, *, refresh: bool = False) -> tuple[Settings, NangoClient, ResolvedNangoSecret]:
     settings, resolver, nango = _runtime()
+    scope = require_scope()
+    configured = frozenset(item.slug for item in settings.environments)
+    if environment not in permitted_environments(configured, scope):
+        raise PermissionError("environment is outside the caller scope")
     secret = await resolver.resolve_nango_secret(environment, refresh=refresh)
     return settings, nango, secret
 
 
-def _assert_confirmation(value: str, expected: str) -> None:
+def _assert_writable() -> None:
     settings, _, _ = _runtime()
     if settings.read_only:
         raise ValueError("This Nango MCP server is running in read-only mode")
-    if settings.require_confirmation and value != expected:
-        raise ValueError(f"confirmation must exactly equal: {expected}")
 
 
 def sanitize_response(value: Any) -> Any:
@@ -171,11 +268,14 @@ def _integration_update_contains_scope_change(fields: dict[str, Any]) -> bool:
 
 
 def _normalized_scope_value(value: Any) -> Any:
+    """Return the comma-delimited scope representation required by Nango."""
     if isinstance(value, list):
-        return [str(item).strip() for item in value]
-    if isinstance(value, str):
-        return value.strip()
-    return value
+        candidates = [str(item).strip() for item in value]
+    elif isinstance(value, str):
+        candidates = re.split(r"[\s,]+", value.strip())
+    else:
+        return value
+    return ",".join(dict.fromkeys(item for item in candidates if item))
 
 
 def _prepare_integration_update_fields(
@@ -207,17 +307,22 @@ def _prepare_integration_update_fields(
                 )
         if "scopes" in credentials and _normalized_scope_value(credentials["scopes"]) != selected_normalized:
             raise ValueError("conflicting scope values supplied at top level and credentials.scopes")
-        credentials["scopes"] = selected_value
+        credentials["scopes"] = selected_normalized
         notes.append(
             "Moved top-level scope field(s) into credentials.scopes; Nango rejects top-level "
             "scopes/oauth_scopes/default_scopes on integration PATCH."
         )
 
     if "scopes" in credentials:
+        credentials["scopes"] = _normalized_scope_value(credentials["scopes"])
         current = _as_data_dict(current_integration or {})
         current_credentials = current.get("credentials")
         if isinstance(current_credentials, dict):
-            merged_credentials = dict(current_credentials)
+            merged_credentials = {
+                key: value
+                for key, value in current_credentials.items()
+                if not _field_is_blank(value)
+            }
             merged_credentials.update({key: value for key, value in credentials.items() if not _field_is_blank(value)})
             credentials = merged_credentials
 
@@ -306,6 +411,170 @@ def _provider_sort_key(provider: dict[str, Any], query: str) -> tuple[int, str]:
     return rank, name or display
 
 
+MUTATION_EFFECTS = {
+    "create_integration": "elevated",
+    "update_integration": "elevated",
+    "delete_integration": "destructive",
+    "refresh_connection_credentials": "elevated",
+    "import_connection": "elevated",
+    "delete_connection": "destructive",
+    "patch_connection_tags": "low",
+    "set_connection_metadata": "low",
+    "create_connect_session": "elevated",
+    "create_standard_connect_session": "elevated",
+    "create_reconnect_session": "elevated",
+    "apply_connection_convention": "low",
+}
+
+
+def _mutation_effect(tool: str, args: tuple[Any, ...]) -> str:
+    if tool == "proxy_request":
+        return "destructive" if len(args) > 2 and str(args[2]).upper() == "DELETE" else "elevated"
+    return MUTATION_EFFECTS[tool]
+
+
+class MutationApprovalError(PermissionError):
+    pass
+
+
+class LegacyMutationApproval(BaseModel):
+    approve: bool = Field(title="Approve this mutation")
+
+
+def _approval_hash(tool: str, environment: str, args: tuple[Any, ...]) -> str:
+    encoded = json.dumps(
+        {"tool": tool, "environment": environment, "args": args},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _approval_message(tool: str, environment: str, args: tuple[Any, ...]) -> str:
+    target = ""
+    if tool in {"update_integration", "delete_integration"} and args:
+        target = f" integration={args[0]}"
+    elif tool in {
+        "refresh_connection_credentials", "delete_connection", "patch_connection_tags",
+        "set_connection_metadata", "create_reconnect_session", "apply_connection_convention",
+    } and len(args) >= 2:
+        target = f" connection={args[0]} integration={args[1]}"
+    elif tool == "proxy_request" and len(args) >= 4:
+        target = f" method={str(args[2]).upper()} path={args[3]} integration={args[0]} connection={args[1]}"
+    return (
+        f"Approve Nango mutation: effect={_mutation_effect(tool, args)} "
+        f"environment={environment} tool={tool}{target}"
+    )
+
+
+async def _target_snapshot(tool: str, environment: str, args: tuple[Any, ...]) -> str | None:
+    target: Any = None
+    if tool in {"update_integration", "delete_integration"}:
+        _, nango, secret = await _resolve(environment)
+        target = await nango.get_integration(secret.nango_secret_key, str(args[0]))
+    elif tool in {
+        "refresh_connection_credentials", "delete_connection", "patch_connection_tags",
+        "set_connection_metadata", "create_reconnect_session", "apply_connection_convention",
+    }:
+        _, nango, secret = await _resolve(environment)
+        target = await nango.get_connection(secret.nango_secret_key, str(args[0]), str(args[1]))
+    if target is None:
+        return None
+    encoded = json.dumps(sanitize_response(target), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _input_required(
+    tool: str,
+    environment: str,
+    args: tuple[Any, ...],
+    snapshot: str | None,
+) -> InputRequiredResult:
+    state = json.dumps(
+        {
+            "v": 1,
+            "tool": tool,
+            "environment": environment,
+            "effect": _mutation_effect(tool, args),
+            "snapshot": snapshot,
+            "requestHash": _approval_hash(tool, environment, args),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return InputRequiredResult(
+        input_requests={
+            "approve": ElicitRequest(
+                params=ElicitRequestFormParams(
+                    message=_approval_message(tool, environment, args),
+                    requestedSchema={
+                        "type": "object",
+                        "properties": {"approve": {"type": "boolean", "title": "Approve this mutation"}},
+                        "required": ["approve"],
+                        "additionalProperties": False,
+                    },
+                )
+            )
+        },
+        request_state=state,
+    )
+
+
+async def _authorize_mutation(
+    ctx: Context | None,
+    tool: str,
+    environment: str,
+    args: tuple[Any, ...],
+) -> InputRequiredResult | None:
+    if ctx is None:
+        return None
+    _assert_writable()
+    caller = require_scope()
+    authorize_operation(caller, tool)
+    if caller.mutation_approval == "host" and _mutation_effect(tool, args) != "destructive":
+        if tool != "proxy_request" or not proxy_route_matches(
+            caller.server_approval_proxy_path_patterns,
+            provider_config_key=str(args[0]),
+            method=str(args[2]),
+            path=str(args[3]),
+        ):
+            return None
+    snapshot = await _target_snapshot(tool, environment, args)
+    if ctx.protocol_version not in MODERN_PROTOCOL_VERSIONS:
+        session = ctx.request_context.session
+        capabilities = session.client_capabilities
+        if not session.can_send_request or capabilities is None or capabilities.elicitation is None:
+            raise MutationApprovalError("MCP client does not support a secure mutation approval flow")
+        response = await ctx.elicit(_approval_message(tool, environment, args), LegacyMutationApproval)
+        if response.action != "accept" or not response.data.approve:
+            raise MutationApprovalError("Nango mutation was not approved")
+        if await _target_snapshot(tool, environment, args) != snapshot:
+            raise MutationApprovalError("Nango mutation target changed during approval")
+        return None
+    if not ctx.request_state or not ctx.input_responses:
+        return _input_required(tool, environment, args, snapshot)
+    try:
+        state = json.loads(ctx.request_state)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise MutationApprovalError("invalid approval state") from exc
+    expected = {
+        "v": 1,
+        "tool": tool,
+        "environment": environment,
+        "effect": _mutation_effect(tool, args),
+        "requestHash": _approval_hash(tool, environment, args),
+    }
+    if any(state.get(key) != value for key, value in expected.items()):
+        raise MutationApprovalError("approval state does not match this operation")
+    if state.get("snapshot") != snapshot:
+        return _input_required(tool, environment, args, snapshot)
+    response = ctx.input_responses.get("approve")
+    if not isinstance(response, ElicitResult) or response.action != "accept" or response.content != {"approve": True}:
+        raise MutationApprovalError("Nango mutation was not approved")
+    return None
+
+
 @mcp.tool()
 def describe_connection_convention() -> dict[str, Any]:
     """Explain the optional Nango MCP connection convention helpers."""
@@ -337,6 +606,10 @@ def list_environments(refresh: bool = False) -> dict[str, Any]:
         "environments": [
             {"environment": item.slug, "accepted_aliases": list(item.aliases)}
             for item in settings.environments
+            if item.slug in permitted_environments(
+                frozenset(environment.slug for environment in settings.environments),
+                require_scope(),
+            )
         ],
         "secret_material_returned": False,
         "refresh_requested": refresh,
@@ -420,24 +693,28 @@ async def search_provider_templates(
 
 
 @mcp.tool()
-async def create_integration(environment: str, payload: dict[str, Any], confirmation: str = "") -> Any:
+async def create_integration(ctx: Context, environment: str, payload: dict[str, Any]) -> Any:
     """Create a Nango integration using the Nango API payload shape."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "create_integration", environment, (payload,))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(await nango.create_integration(secret.nango_secret_key, payload))
 
 
 @mcp.tool()
 async def update_integration(
+    ctx: Context,
     environment: str,
     integration_id: str,
     fields: dict[str, Any],
-    confirmation: str = "",
     reconnect_connection_ids: list[str] | None = None,
     auto_reconnect_single_matching_connection: bool = True,
 ) -> Any:
     """Patch a Nango integration."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "update_integration", environment, (integration_id, fields))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     scope_change = _integration_update_contains_scope_change(fields)
     current_integration = None
@@ -502,9 +779,11 @@ async def update_integration(
 
 
 @mcp.tool()
-async def delete_integration(environment: str, integration_id: str, confirmation: str = "") -> Any:
+async def delete_integration(ctx: Context, environment: str, integration_id: str) -> Any:
     """Delete a Nango integration."""
-    _assert_confirmation(confirmation, DELETE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "delete_integration", environment, (integration_id,))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(await nango.delete_integration(secret.nango_secret_key, integration_id))
 
@@ -549,6 +828,47 @@ async def get_connection(
             include_credentials=include_credentials,
         )
     )
+
+
+@mcp.tool()
+async def refresh_connection_credentials(
+    ctx: Context,
+    environment: str,
+    connection_id: str,
+    provider_config_key: str,
+) -> dict[str, Any]:
+    """Force an OAuth refresh and return only a non-secret credential summary."""
+    approval = await _authorize_mutation(
+        ctx, "refresh_connection_credentials", environment, (connection_id, provider_config_key)
+    )
+    if approval:
+        return approval
+    _, nango, secret = await _resolve(environment)
+    response = await nango.get_connection(
+        secret.nango_secret_key,
+        connection_id,
+        provider_config_key,
+        include_credentials=True,
+        force_refresh=True,
+    )
+    credentials = response.get("credentials", {}) if isinstance(response, dict) else {}
+    if not isinstance(credentials, dict):
+        credentials = {}
+    raw_credentials = credentials.get("raw", {})
+    if not isinstance(raw_credentials, dict):
+        raw_credentials = {}
+    return {
+        "connection_id": connection_id,
+        "provider_config_key": provider_config_key,
+        "refreshed": True,
+        "credential_summary": {
+            "has_access_token": bool(credentials.get("access_token")),
+            "has_refresh_token": bool(credentials.get("refresh_token")),
+            "token_type": credentials.get("token_type") or raw_credentials.get("token_type"),
+            "scope": credentials.get("scope") or raw_credentials.get("scope"),
+            "expires_at": credentials.get("expires_at") or raw_credentials.get("expires_at"),
+        },
+    }
 
 
 @mcp.tool()
@@ -598,36 +918,44 @@ async def get_connection_context(
 
 
 @mcp.tool()
-async def import_connection(environment: str, payload: dict[str, Any], confirmation: str = "") -> Any:
+async def import_connection(ctx: Context, environment: str, payload: dict[str, Any]) -> Any:
     """Import/create a connection using the Nango API payload shape."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "import_connection", environment, (payload,))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(await nango.import_connection(secret.nango_secret_key, payload))
 
 
 @mcp.tool()
 async def delete_connection(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
-    confirmation: str = "",
 ) -> Any:
     """Delete one Nango connection."""
-    _assert_confirmation(confirmation, DELETE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "delete_connection", environment, (connection_id, provider_config_key))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(await nango.delete_connection(secret.nango_secret_key, connection_id, provider_config_key))
 
 
 @mcp.tool()
 async def patch_connection_tags(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
     tags: dict[str, str],
-    confirmation: str = "",
 ) -> Any:
     """Replace a connection's complete tag set. Fetch and merge first when changing one tag."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "patch_connection_tags", environment, (connection_id, provider_config_key, tags)
+    )
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
         await nango.patch_connection_tags(secret.nango_secret_key, connection_id, provider_config_key, tags)
@@ -636,15 +964,19 @@ async def patch_connection_tags(
 
 @mcp.tool()
 async def set_connection_metadata(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
     metadata: dict[str, Any],
     patch: bool = False,
-    confirmation: str = "",
 ) -> Any:
     """Set or patch connection metadata. Do not put credentials or required connection config here."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "set_connection_metadata", environment, (connection_id, provider_config_key, metadata, patch)
+    )
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
         await nango.set_connection_metadata(
@@ -659,14 +991,18 @@ async def set_connection_metadata(
 
 @mcp.tool()
 async def create_connect_session(
+    ctx: Context,
     environment: str,
     allowed_integrations: list[str],
     tags: dict[str, str] | None = None,
     integrations_config_defaults: dict[str, Any] | None = None,
-    confirmation: str = "",
 ) -> Any:
     """Create a Nango Connect session token."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "create_connect_session", environment, (allowed_integrations, tags, integrations_config_defaults)
+    )
+    if approval:
+        return approval
     payload: dict[str, Any] = {"allowed_integrations": allowed_integrations}
     if tags:
         payload["tags"] = tags
@@ -679,6 +1015,7 @@ async def create_connect_session(
 
 @mcp.tool()
 async def create_standard_connect_session(
+    ctx: Context,
     environment: str,
     provider_config_key: str,
     principal: str,
@@ -688,10 +1025,14 @@ async def create_standard_connect_session(
     display_name: str | None = None,
     email: str | None = None,
     integrations_config_defaults: dict[str, Any] | None = None,
-    confirmation: str = "",
+    oauth_app_owner: str | None = None,
 ) -> Any:
-    """Create a Connect session with recommended Nango tags plus optional MCP convention tags."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    """Create a Connect session and return its post-auth finalization contract."""
+    approval = await _authorize_mutation(
+        ctx, "create_standard_connect_session", environment, (provider_config_key, principal)
+    )
+    if approval:
+        return approval
     tags = convention_tags(
         environment,
         principal,
@@ -707,18 +1048,43 @@ async def create_standard_connect_session(
 
     _, nango, secret = await _resolve(environment)
     response = sanitize_response(await nango.create_connect_session(secret.nango_secret_key, payload))
-    return {"tags": tags, "response": response}
+    settings, _, _ = _runtime()
+    return {
+        "tags": tags,
+        "post_auth_finalization": {
+            "provider_config_key": provider_config_key,
+            "principal": principal.strip(),
+            "owner_kind": owner_kind,
+            "purpose": purpose,
+            "oauth_app_owner": oauth_app_owner,
+            "display_name": display_name.strip() if display_name else principal.strip(),
+            "email": email.strip() if email else None,
+            "metadata": convention_metadata(
+                environment,
+                principal,
+                owner_kind,
+                purpose,
+                namespace=settings.metadata_namespace,
+                oauth_app_owner=oauth_app_owner,
+            ),
+        },
+        "response": response,
+    }
 
 
 @mcp.tool()
 async def create_reconnect_session(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
-    confirmation: str = "",
 ) -> Any:
     """Create a Nango reconnect session for an existing connection."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "create_reconnect_session", environment, (connection_id, provider_config_key)
+    )
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
         await nango.create_reconnect_session(
@@ -729,32 +1095,293 @@ async def create_reconnect_session(
     )
 
 
+def _camelize_owned_envelope(value: dict[str, Any]) -> dict[str, Any]:
+    """Camel-case MCP-owned envelope keys while preserving provider JSON verbatim."""
+    mapping = {
+        "content_type": "contentType",
+        "response_headers": "responseHeaders",
+        "rate_limit": "rateLimit",
+    }
+    result = {mapping.get(key, key): child for key, child in value.items()}
+    rate_limit = result.get("rateLimit")
+    if isinstance(rate_limit, dict):
+        result["rateLimit"] = {
+            re.sub(r"_([a-z])", lambda match: match.group(1).upper(), str(key)): child
+            for key, child in rate_limit.items()
+        }
+    return result
+
+
+def _artifact_store(settings: Settings) -> ArtifactStore:
+    root = settings.artifact_root
+    if not root:
+        uid = getattr(os, "getuid", lambda: 0)()
+        root = str(Path(tempfile.gettempdir()) / f"nango-mcp-{uid}" / "artifacts")
+    key = settings.request_state_keys[0] if settings.request_state_keys else _state_keys[0]
+    return ArtifactStore(
+        root,
+        "nango-mcp://artifact",
+        key,
+        settings.artifact_ttl_seconds,
+        settings.artifact_max_bytes,
+    )
+
+
+def _binary_store(settings: Settings) -> BinaryResourceStore:
+    root = settings.artifact_root
+    if not root:
+        uid = getattr(os, "getuid", lambda: 0)()
+        root = str(Path(tempfile.gettempdir()) / f"nango-mcp-{uid}" / "artifacts")
+    return BinaryResourceStore(str(Path(root) / "downloads"), settings.artifact_ttl_seconds)
+
+
+def _artifact_tool_result(result: dict[str, Any]) -> CallToolResult:
+    meta = result.get("responseMeta")
+    artifact = meta.get("artifact") if isinstance(meta, dict) else None
+    content: list[Any] = [
+        TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    ]
+    if isinstance(artifact, dict) and artifact.get("uri"):
+        content.append(
+            ResourceLink(
+                name=f"Nango response {artifact['id']}",
+                uri=artifact["uri"],
+                mimeType=artifact["mediaType"],
+                size=artifact["byteLength"],
+                description="Complete immutable provider response envelope",
+            )
+        )
+    return CallToolResult(
+        content=content,
+        structuredContent=result,
+    )
+
+
 @mcp.tool(structured_output=False)
 async def proxy_request(
+    ctx: Context,
     environment: str,
-    provider_config_key: str,
-    connection_id: str,
+    providerConfigKey: str,
+    connectionId: str,
     method: str,
     path: str,
     query: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
-    base_url_override: str | None = None,
+    baseUrlOverride: str | None = None,
     body: Any | None = None,
-) -> str:
+    responseMode: str = "auto",
+    responsePath: str | None = None,
+    fields: list[str] | None = None,
+    filters: list[dict[str, Any]] | None = None,
+    pageSize: int = 20,
+    cursor: str | None = None,
+) -> Any:
     """Call a provider API through the Nango Proxy without exposing provider tokens."""
-    _, nango, secret = await _resolve(environment)
-    response = await nango.proxy_request(
-        secret.nango_secret_key,
-        provider_config_key,
-        connection_id,
-        method,
-        path,
-        query=query,
-        headers=headers,
-        base_url_override=base_url_override,
-        body=body,
+    normalized_method = method.strip().upper()
+    caller = require_scope()
+    authorize_operation(
+        caller,
+        "proxy_request",
+        provider_config_key=providerConfigKey,
+        method=normalized_method,
+        path=path,
     )
-    return json_response_text(response)
+    mutation_args = (
+        providerConfigKey, connectionId, normalized_method, path, query, headers,
+        baseUrlOverride, body,
+    )
+    if normalized_method not in {"GET", "HEAD"}:
+        approval = await _authorize_mutation(ctx, "proxy_request", environment, mutation_args)
+        if approval:
+            return approval
+    if responseMode not in {"auto", "inline", "artifact"}:
+        raise ValueError("responseMode must be auto, inline, or artifact")
+    settings, nango, secret = await _resolve(environment)
+    environment_token = current_environment.set(environment)
+    try:
+        gate = _environment_gate or EnvironmentConcurrencyGate(4, 30.0)
+        async with gate.acquire(environment):
+            response = await nango.proxy_request(
+                secret.nango_secret_key,
+                providerConfigKey,
+                connectionId,
+                normalized_method,
+                path,
+                query=query,
+                headers=headers,
+                base_url_override=baseUrlOverride,
+                body=body,
+            )
+    finally:
+        current_environment.reset(environment_token)
+    public_response = _camelize_owned_envelope(response)
+    if public_response.get("rateLimit") is not None:
+        return _artifact_tool_result(public_response)
+    caller = require_scope()
+    key = settings.request_state_keys[0] if settings.request_state_keys else _state_keys[0]
+    bounded = bound_proxy_response(
+        public_response,
+        owner=caller.label,
+        environment=environment,
+        cursor_key=key,
+        store=_artifact_store(settings),
+        response_mode="full" if responseMode == "inline" else responseMode,
+        response_path=responsePath,
+        fields=fields,
+        response_filter=filters,
+        response_page_size=pageSize,
+        response_cursor=cursor,
+    )
+    return _artifact_tool_result(bounded)
+
+
+@mcp.resource(
+    "nango-mcp://artifact/{artifactId}",
+    name="Nango response artifact",
+    description="Authenticated complete provider response envelope",
+    mime_type="application/json",
+)
+def read_response_artifact(artifactId: str) -> str:
+    settings, _, _ = _runtime()
+    caller = require_scope()
+    configured = frozenset(item.slug for item in settings.environments)
+    permitted = permitted_environments(configured, caller)
+    content, _ = _artifact_store(settings).read_authorized(
+        artifactId,
+        owner=caller.label,
+        environments=permitted,
+    )
+    return content.decode("utf-8")
+
+
+@mcp.tool(structured_output=False)
+async def query_response_artifact(
+    environment: str,
+    artifactId: str,
+    responsePath: str | None = None,
+    fields: list[str] | None = None,
+    filters: list[dict[str, Any]] | None = None,
+    pageSize: int = 20,
+    cursor: str | None = None,
+    describe: bool = False,
+    objectMode: Literal["entries"] | None = None,
+    textSearch: dict[str, Any] | None = None,
+) -> CallToolResult:
+    """Query a stored provider response with bounded, strict camelCase controls."""
+    settings, _, _ = await _resolve(environment)
+    caller = require_scope()
+    store = _artifact_store(settings)
+    store.prune()
+    result = store.query(
+        artifactId,
+        owner=caller.label,
+        environment=environment,
+        response_path=responsePath,
+        fields=fields,
+        response_filter=filters,
+        response_page_size=pageSize,
+        cursor=cursor,
+        describe=describe,
+        object_mode=objectMode,
+        text_search=textSearch,
+    )
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))],
+        structuredContent=result,
+    )
+
+
+@mcp.tool(structured_output=False)
+async def download_provider_file(
+    environment: str,
+    providerConfigKey: str,
+    connectionId: str,
+    path: str,
+    query: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    baseUrlOverride: str | None = None,
+    suggestedName: str | None = None,
+) -> CallToolResult:
+    """Stream a provider GET response into a protected MCP binary resource."""
+    caller = require_scope()
+    authorize_operation(
+        caller,
+        "download_provider_file",
+        provider_config_key=providerConfigKey,
+        method="GET",
+        path=path,
+    )
+    if suggestedName is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", suggestedName):
+        raise ValueError("suggestedName must be a plain 1-120 character filename")
+    settings, nango, secret = await _resolve(environment)
+    store = _binary_store(settings)
+    store.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = store.root / f".incoming-{secrets.token_urlsafe(18)}"
+    safe_headers = {
+        key: value
+        for key, value in (headers or {}).items()
+        if key.lower() not in {"accept", "nango-proxy-accept"}
+    }
+    environment_token = current_environment.set(environment)
+    try:
+        gate = _environment_gate or EnvironmentConcurrencyGate(4, 30.0)
+        async with gate.acquire(environment):
+            metadata = await nango.download_provider_file(
+                secret.nango_secret_key,
+                providerConfigKey,
+                connectionId,
+                path,
+                destination,
+                max_bytes=settings.artifact_max_bytes,
+                query=query,
+                headers=safe_headers,
+                base_url_override=baseUrlOverride,
+            )
+        resource = store.ingest(
+            destination,
+            owner=caller.label,
+            environment=environment,
+            content_type=str(metadata["content_type"]),
+            byte_length=int(metadata["byte_length"]),
+            sha256=str(metadata["sha256"]),
+            suggested_name=suggestedName,
+        )
+    finally:
+        current_environment.reset(environment_token)
+        destination.unlink(missing_ok=True)
+    result = {"ok": True, "status": metadata["status"], "resource": resource}
+    return CallToolResult(
+        content=[
+            TextContent(type="text", text=json.dumps(result, separators=(",", ":"))),
+            ResourceLink(
+                name=suggestedName or f"Provider download {resource['id']}",
+                uri=resource["uri"],
+                mimeType=resource["contentType"],
+                size=resource["byteLength"],
+                description="Complete provider binary response",
+            ),
+        ],
+        structuredContent=result,
+    )
+
+
+@mcp.resource(
+    "nango-mcp://download/{resourceId}",
+    name="Nango provider download",
+    description="Authenticated complete provider binary response",
+    mime_type="application/octet-stream",
+)
+def read_provider_download(resourceId: str) -> bytes:
+    settings, _, _ = _runtime()
+    caller = require_scope()
+    configured = frozenset(item.slug for item in settings.environments)
+    permitted = permitted_environments(configured, caller)
+    content, _ = _binary_store(settings).read_authorized(
+        resourceId,
+        owner=caller.label,
+        environments=permitted,
+    )
+    return content
 
 
 @mcp.tool()
@@ -784,6 +1411,7 @@ def build_connection_convention(
 
 @mcp.tool()
 async def apply_connection_convention(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
@@ -792,10 +1420,15 @@ async def apply_connection_convention(
     purpose: str,
     oauth_app_owner: str | None = None,
     patch_metadata: bool = True,
-    confirmation: str = "",
+    display_name: str | None = None,
+    email: str | None = None,
 ) -> dict[str, Any]:
     """Apply suggested Nango MCP tags and metadata to an existing connection."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "apply_connection_convention", environment, (connection_id, provider_config_key, principal)
+    )
+    if approval:
+        return approval
     settings, nango, secret = await _resolve(environment)
     tags = convention_tags(secret.environment, principal, owner_kind, purpose)
     metadata = convention_metadata(
@@ -809,6 +1442,15 @@ async def apply_connection_convention(
     existing = await nango.get_connection(secret.nango_secret_key, connection_id, provider_config_key)
     existing_tags = existing.get("tags") if isinstance(existing, dict) else None
     merged_tags = {**(existing_tags or {}), **tags}
+    existing_end_user = existing.get("end_user") if isinstance(existing, dict) else None
+    if not isinstance(existing_end_user, dict):
+        existing_end_user = {}
+    projected_display_name = display_name.strip() if display_name else existing_end_user.get("display_name")
+    projected_email = email.strip() if email else existing_end_user.get("email")
+    if projected_display_name:
+        merged_tags["end_user_display_name"] = projected_display_name
+    if projected_email:
+        merged_tags["end_user_email"] = projected_email
     tag_response = await nango.patch_connection_tags(
         secret.nango_secret_key,
         connection_id,
@@ -824,6 +1466,10 @@ async def apply_connection_convention(
     )
     return {
         "tags": merged_tags,
+        "identity_projection": {
+            "display_name": projected_display_name,
+            "email": projected_email,
+        },
         "metadata": metadata,
         "tag_response": sanitize_response(tag_response),
         "metadata_response": sanitize_response(metadata_response),
@@ -866,5 +1512,205 @@ async def audit_connection_conventions(environment: str, limit: int = 100) -> di
     }
 
 
+def _enforce_strict_tool_arguments(*names: str) -> None:
+    for name in names:
+        tool = mcp._tool_manager.get_tool(name)  # type: ignore[attr-defined]
+        if tool is None:
+            raise RuntimeError(f"cannot harden unregistered MCP tool {name}")
+        argument_model = tool.fn_metadata.arg_model
+        argument_model.model_config["extra"] = "forbid"
+        argument_model.model_rebuild(force=True)
+        tool.parameters = argument_model.model_json_schema(by_alias=True)
+
+
+_enforce_strict_tool_arguments(
+    "proxy_request",
+    "query_response_artifact",
+    "download_provider_file",
+)
+
+
+def _audit_event(*, caller: str, outcome: str, duration_ms: int, tool: str = "unknown") -> None:
+    print(
+        json.dumps(
+            {
+                "event": "mcp_request",
+                "caller": caller,
+                "tool": tool,
+                "outcome": outcome,
+                "durationMs": duration_ms,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+class BearerScopeMiddleware:
+    """Authenticate HTTP requests without logging credentials or payloads."""
+
+    def __init__(self, app: ASGIApp, registry: TokenRegistry | TokenRegistrySource) -> None:
+        self.app = app
+        self.registry = registry
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path") == "/health":
+            await JSONResponse({"status": "ok"})(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        started = time.monotonic()
+        try:
+            registry = self.registry.current() if isinstance(self.registry, TokenRegistrySource) else self.registry
+            caller = authenticate(headers.get("authorization"), registry)
+        except PermissionError:
+            _audit_event(
+                caller="unauthenticated",
+                outcome="auth_failure",
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+            await Response(status_code=401)(scope, receive, send)
+            return
+        except (OSError, RuntimeError):
+            _audit_event(
+                caller="unauthenticated",
+                outcome="policy_failure",
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+            await Response(status_code=503)(scope, receive, send)
+            return
+
+        status_code = 200
+
+        async def capture_status(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+            await send(message)
+
+        scope_token = set_scope(caller)
+        try:
+            await self.app(scope, receive, capture_status)
+        finally:
+            reset_scope(scope_token)
+        if status_code >= 400:
+            _audit_event(
+                caller=caller.label,
+                tool=headers.get("mcp-name", "unknown"),
+                outcome="request_failure" if status_code < 500 else "transport_failure",
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+
+
+class OAuthScopeMiddleware:
+    """Bind validated OAuth claims to the same environment policy as static auth."""
+
+    def __init__(self, app: ASGIApp, verifier: OAuthIntrospectionVerifier) -> None:
+        self.app = app
+        self.verifier = verifier
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") == "/health":
+            await self.app(scope, receive, send)
+            return
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        authorization = headers.get("authorization", "")
+        if not authorization.startswith("Bearer "):
+            await Response(status_code=401)(scope, receive, send)
+            return
+        access_token = await self.verifier.verify_token(authorization[7:].strip())
+        if access_token is None:
+            await Response(status_code=401)(scope, receive, send)
+            return
+        try:
+            caller = caller_scope_from_access_token(access_token)
+        except PermissionError:
+            await Response(status_code=403)(scope, receive, send)
+            return
+        scope_token = set_scope(caller)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_scope(scope_token)
+
+
+def create_http_app(
+    settings: Settings,
+    registry: TokenRegistry | TokenRegistrySource | None = None,
+) -> ASGIApp:
+    request_state_boundary = next(
+        (
+            middleware
+            for middleware in mcp._lowlevel_server.middleware  # type: ignore[attr-defined]
+            if isinstance(middleware, RequestStateBoundary)
+        ),
+        None,
+    )
+    if request_state_boundary is None:
+        raise RuntimeError("MCP request-state boundary is unavailable")
+    request_state_boundary._security = RequestStateSecurity(  # type: ignore[attr-defined]
+        keys=list(settings.request_state_keys),
+        ttl=settings.request_state_ttl_seconds,
+        bind_principal=_request_state_principal,
+    )
+    oauth_verifier: OAuthIntrospectionVerifier | None = None
+    if settings.auth_mode == "oauth":
+        if settings.oauth is None:
+            raise RuntimeError("OAuth settings are unavailable")
+        oauth_verifier = OAuthIntrospectionVerifier(settings.oauth)
+        mcp.settings.auth = AuthSettings(
+            issuer_url=settings.oauth.issuer_url,
+            resource_server_url=settings.oauth.resource_url,
+            required_scopes=list(settings.oauth.required_scopes),
+        )
+        mcp._token_verifier = oauth_verifier  # type: ignore[attr-defined]
+    else:
+        resolved_registry = registry or TokenRegistrySource(
+            settings.token_registry_raw,
+            settings.denied_environments,
+            settings.token_registry_file,
+        )
+
+    @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+    async def health(_: Request) -> Response:
+        return JSONResponse({"status": "ok"})
+
+    app = mcp.streamable_http_app(
+        streamable_http_path="/mcp",
+        stateless_http=False,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=list(settings.http_allowed_hosts),
+            allowed_origins=[],
+        ),
+        host=settings.http_host,
+    )
+    if oauth_verifier is not None:
+        return OAuthScopeMiddleware(app, oauth_verifier)
+    return BearerScopeMiddleware(app, resolved_registry)
+
+
 def main() -> None:
-    mcp.run()
+    settings = load_settings()
+    if settings.transport == "http":
+        uvicorn.run(create_http_app(settings), host=settings.http_host, port=settings.http_port)
+        return
+    implicit = CallerScope(
+        label="local-stdio",
+        environments=frozenset(item.slug for item in settings.environments),
+    )
+    scope_token = set_scope(implicit)
+    try:
+        mcp.run("stdio")
+    finally:
+        reset_scope(scope_token)

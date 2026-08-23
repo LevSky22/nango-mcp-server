@@ -5,8 +5,12 @@ from nango_mcp.nango import NangoClient
 
 
 class CapturingNangoClient(NangoClient):
-    def __init__(self) -> None:
-        super().__init__("https://nango.example.test")
+    def __init__(
+        self,
+        base_url: str = "https://nango.example.test",
+        public_base_url: str | None = None,
+    ) -> None:
+        super().__init__(base_url, public_base_url=public_base_url)
         self.calls = []
 
     async def _send(self, secret_key, method, path, *, params=None, body=None, headers=None):
@@ -114,6 +118,38 @@ async def test_create_connect_session_adds_self_hosted_api_url_to_connect_link()
         == "https://connect.example.test/?session_token=nango_connect_session_test&apiURL=https%3A%2F%2Fnango.example.test"
     )
 
+
+@pytest.mark.asyncio
+async def test_connect_link_replaces_internal_api_url_with_public_url() -> None:
+    client = ConnectSessionNangoClient(
+        base_url="http://nango-service:3003",
+        public_base_url="https://nango.example.test",
+    )
+
+    link = client._with_self_hosted_api_url(
+        "https://connect.example.test/?session_token=test&apiURL=http%3A%2F%2Fnango-service%3A3003"
+    )
+
+    assert link.endswith("apiURL=https%3A%2F%2Fnango.example.test")
+
+
+@pytest.mark.asyncio
+async def test_get_connection_uses_supported_refresh_query_parameters() -> None:
+    client = CapturingNangoClient()
+
+    await client.get_connection(
+        "nango-secret",
+        "connection-id",
+        "example-integration",
+        include_credentials=True,
+        force_refresh=True,
+    )
+
+    assert client.calls[0]["params"] == {
+        "provider_config_key": "example-integration",
+        "refresh_token": "true",
+        "force_refresh": "true",
+    }
 
 @pytest.mark.asyncio
 async def test_create_reconnect_session_uses_nango_reconnect_body_shape() -> None:

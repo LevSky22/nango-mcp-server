@@ -52,14 +52,13 @@ def test_load_settings_requires_direct_secret(tmp_path, monkeypatch: pytest.Monk
         load_settings()
 
 
-def test_load_settings_supports_optional_mutation_guards(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_settings_supports_read_only_mode(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text(
         "\n".join(
             [
                 "NANGO_SECRET_KEY=secret_default",
                 "NANGO_MCP_READ_ONLY=true",
-                "NANGO_MCP_REQUIRE_CONFIRMATION=true",
             ]
         )
     )
@@ -68,4 +67,35 @@ def test_load_settings_supports_optional_mutation_guards(tmp_path, monkeypatch: 
     settings = load_settings()
 
     assert settings.read_only is True
-    assert settings.require_confirmation is True
+
+
+def test_http_static_auth_requires_a_token_registry(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("NANGO_SECRET_KEY=secret_default\nNANGO_MCP_TRANSPORT=http\n")
+    monkeypatch.setenv("NANGO_MCP_ENV_FILE", str(env_file))
+
+    with pytest.raises(RuntimeError, match="TOKEN"):
+        load_settings()
+
+
+def test_http_oauth_loads_resource_server_settings(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "NANGO_SECRET_KEY=secret_default",
+                "NANGO_MCP_TRANSPORT=http",
+                "NANGO_MCP_AUTH_MODE=oauth",
+                "NANGO_MCP_OAUTH_ISSUER_URL=https://identity.example.test",
+                "NANGO_MCP_OAUTH_RESOURCE_URL=https://mcp.example.test/mcp",
+                "NANGO_MCP_OAUTH_INTROSPECTION_URL=https://identity.example.test/oauth/introspect",
+                "NANGO_MCP_OAUTH_CLIENT_ID=resource-server",
+                "NANGO_MCP_OAUTH_CLIENT_SECRET=test-secret",
+                "NANGO_MCP_REQUEST_STATE_KEYS=test-request-state-key-at-least-32-bytes",
+            ]
+        )
+    )
+    monkeypatch.setenv("NANGO_MCP_ENV_FILE", str(env_file))
+    settings = load_settings()
+    assert settings.oauth is not None
+    assert settings.oauth.resource_url == "https://mcp.example.test/mcp"

@@ -11,6 +11,9 @@ DEFAULT_ENVIRONMENT = "default"
 DEFAULT_METADATA_NAMESPACE = "nango_mcp"
 DEFAULT_INFISICAL_SECRET_PATH_TEMPLATE = "/nango/{environment}"
 DEFAULT_INFISICAL_SECRET_NAME = "NANGO_SECRET_KEY"
+DEFAULT_REQUEST_STATE_TTL_SECONDS = 15 * 60
+MIN_REQUEST_STATE_TTL_SECONDS = 60
+MAX_REQUEST_STATE_TTL_SECONDS = 60 * 60
 
 
 @dataclass(frozen=True)
@@ -32,15 +35,52 @@ class InfisicalSettings:
 
 
 @dataclass(frozen=True)
+class OAuthSettings:
+    issuer_url: str
+    resource_url: str
+    introspection_url: str
+    client_id: str
+    client_secret: str
+    required_scopes: tuple[str, ...] = ("nango-mcp",)
+
+
+@dataclass(frozen=True)
 class Settings:
     nango_url: str
     environments: tuple[EnvironmentConfig, ...]
+    public_nango_url: str | None = None
     secret_resolver: str = "direct"
     metadata_namespace: str = DEFAULT_METADATA_NAMESPACE
     request_timeout: float = 20.0
     read_only: bool = False
-    require_confirmation: bool = False
     infisical: InfisicalSettings | None = None
+    transport: str = "stdio"
+    http_host: str = "127.0.0.1"
+    http_port: int = 3000
+    http_allowed_hosts: tuple[str, ...] = (
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+        "testserver",
+    )
+    auth_mode: str = "static"
+    token_registry_raw: str = ""
+    token_registry_file: str = ""
+    denied_environments: frozenset[str] = frozenset()
+    request_state_keys: tuple[str, ...] = ()
+    request_state_ttl_seconds: int = DEFAULT_REQUEST_STATE_TTL_SECONDS
+    oauth: OAuthSettings | None = None
+    rate_limit_max_attempts: int = 4
+    rate_limit_max_wait_seconds: float = 45.0
+    rate_limit_backoff_base_seconds: float = 1.0
+    rate_limit_retry_ceiling_seconds: float = 30.0
+    environment_max_concurrency: int = 4
+    environment_acquire_timeout_seconds: float = 30.0
+    http_max_connections: int = 40
+    http_max_keepalive: int = 10
+    artifact_root: str = ""
+    artifact_max_bytes: int = 50 * 1024 * 1024
+    artifact_ttl_seconds: int = 24 * 60 * 60
 
 
 def env_key_for_slug(slug: str) -> str:
@@ -86,6 +126,35 @@ def _timeout(values: dict[str, str]) -> float:
         return float(raw)
     except ValueError:
         return 20.0
+
+
+def _positive_float(values: dict[str, str], name: str, default: float) -> float:
+    raw = _value(values, name, default=str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive number") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive number")
+    return value
+
+
+def _positive_int(values: dict[str, str], name: str, default: int) -> int:
+    raw = _value(values, name, default=str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return value
+
+
+def _port(values: dict[str, str], name: str, default: int) -> int:
+    value = _positive_int(values, name, default)
+    if value > 65535:
+        raise RuntimeError(f"{name} must be between 1 and 65535")
+    return value
 
 
 def _bool(values: dict[str, str], name: str, *, default: bool = False) -> bool:
@@ -147,6 +216,42 @@ def _load_infisical(values: dict[str, str], secret_resolver: str) -> InfisicalSe
     return settings
 
 
+def _load_oauth(values: dict[str, str], transport: str, auth_mode: str) -> OAuthSettings | None:
+    if transport != "http" or auth_mode != "oauth":
+        return None
+    settings = OAuthSettings(
+        issuer_url=_value(values, "NANGO_MCP_OAUTH_ISSUER_URL").rstrip("/"),
+        resource_url=_value(values, "NANGO_MCP_OAUTH_RESOURCE_URL").rstrip("/"),
+        introspection_url=_value(values, "NANGO_MCP_OAUTH_INTROSPECTION_URL"),
+        client_id=_value(values, "NANGO_MCP_OAUTH_CLIENT_ID"),
+        client_secret=_value(values, "NANGO_MCP_OAUTH_CLIENT_SECRET"),
+        required_scopes=_csv(
+            _value(values, "NANGO_MCP_OAUTH_REQUIRED_SCOPES", default="nango-mcp")
+        ),
+    )
+    missing = [
+        name
+        for name, value in {
+            "NANGO_MCP_OAUTH_ISSUER_URL": settings.issuer_url,
+            "NANGO_MCP_OAUTH_RESOURCE_URL": settings.resource_url,
+            "NANGO_MCP_OAUTH_INTROSPECTION_URL": settings.introspection_url,
+            "NANGO_MCP_OAUTH_CLIENT_ID": settings.client_id,
+            "NANGO_MCP_OAUTH_CLIENT_SECRET": settings.client_secret,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Missing OAuth resource-server settings: {', '.join(missing)}")
+    for name, value in (
+        ("NANGO_MCP_OAUTH_ISSUER_URL", settings.issuer_url),
+        ("NANGO_MCP_OAUTH_RESOURCE_URL", settings.resource_url),
+        ("NANGO_MCP_OAUTH_INTROSPECTION_URL", settings.introspection_url),
+    ):
+        if not value.startswith("https://") and not value.startswith("http://127.0.0.1") and not value.startswith("http://localhost"):
+            raise RuntimeError(f"{name} must use HTTPS except for loopback development")
+    return settings
+
+
 def load_settings() -> Settings:
     env_file = os.getenv("NANGO_MCP_ENV_FILE", ".env")
     file_values = _read_env_file(env_file)
@@ -154,8 +259,37 @@ def load_settings() -> Settings:
     if secret_resolver not in {"direct", "infisical"}:
         raise RuntimeError("NANGO_MCP_SECRET_RESOLVER must be 'direct' or 'infisical'")
 
+    transport = _value(file_values, "NANGO_MCP_TRANSPORT", default="stdio").lower()
+    if transport not in {"stdio", "http"}:
+        raise RuntimeError("NANGO_MCP_TRANSPORT must be 'stdio' or 'http'")
+    auth_mode = _value(file_values, "NANGO_MCP_AUTH_MODE", default="static").lower()
+    if auth_mode not in {"static", "oauth"}:
+        raise RuntimeError("NANGO_MCP_AUTH_MODE must be 'static' or 'oauth'")
+    request_state_keys = _csv(_value(file_values, "NANGO_MCP_REQUEST_STATE_KEYS"))
+    request_state_ttl = _positive_int(
+        file_values,
+        "NANGO_MCP_REQUEST_STATE_TTL_SECONDS",
+        DEFAULT_REQUEST_STATE_TTL_SECONDS,
+    )
+    if not MIN_REQUEST_STATE_TTL_SECONDS <= request_state_ttl <= MAX_REQUEST_STATE_TTL_SECONDS:
+        raise RuntimeError(
+            "NANGO_MCP_REQUEST_STATE_TTL_SECONDS must be between "
+            f"{MIN_REQUEST_STATE_TTL_SECONDS} and {MAX_REQUEST_STATE_TTL_SECONDS}"
+        )
+    token_registry_raw = _value(file_values, "NANGO_MCP_TOKENS")
+    token_registry_file = _value(file_values, "NANGO_MCP_TOKEN_REGISTRY_FILE")
+    if transport == "http" and auth_mode == "static" and not (token_registry_raw or token_registry_file):
+        raise RuntimeError(
+            "NANGO_MCP_TOKENS or NANGO_MCP_TOKEN_REGISTRY_FILE is required for static HTTP auth"
+        )
+    if transport == "http" and not request_state_keys:
+        raise RuntimeError("NANGO_MCP_REQUEST_STATE_KEYS is required for HTTP transport")
+
     return Settings(
         nango_url=_value(file_values, "NANGO_BASE_URL", "NANGO_MCP_NANGO_URL", default=DEFAULT_NANGO_URL).rstrip("/"),
+        public_nango_url=(
+            _value(file_values, "NANGO_MCP_PUBLIC_NANGO_URL") or None
+        ),
         environments=_load_environments(file_values, secret_resolver),
         secret_resolver=secret_resolver,
         metadata_namespace=_value(
@@ -165,6 +299,37 @@ def load_settings() -> Settings:
         ),
         request_timeout=_timeout(file_values),
         read_only=_bool(file_values, "NANGO_MCP_READ_ONLY"),
-        require_confirmation=_bool(file_values, "NANGO_MCP_REQUIRE_CONFIRMATION"),
         infisical=_load_infisical(file_values, secret_resolver),
+        transport=transport,
+        http_host=_value(file_values, "NANGO_MCP_HTTP_HOST", default="127.0.0.1"),
+        http_port=_port(file_values, "NANGO_MCP_HTTP_PORT", 3000),
+        http_allowed_hosts=_csv(
+            _value(
+                file_values,
+                "NANGO_MCP_HTTP_ALLOWED_HOSTS",
+                default="127.0.0.1:*,localhost:*,[::1]:*,testserver",
+            )
+        ),
+        auth_mode=auth_mode,
+        token_registry_raw=token_registry_raw,
+        token_registry_file=token_registry_file,
+        denied_environments=frozenset(
+            item.lower() for item in _csv(_value(file_values, "NANGO_MCP_DENY_ENVIRONMENTS"))
+        ),
+        request_state_keys=request_state_keys,
+        request_state_ttl_seconds=request_state_ttl,
+        oauth=_load_oauth(file_values, transport, auth_mode),
+        rate_limit_max_attempts=_positive_int(file_values, "NANGO_MCP_RATE_LIMIT_MAX_ATTEMPTS", 4),
+        rate_limit_max_wait_seconds=_positive_float(file_values, "NANGO_MCP_RATE_LIMIT_MAX_WAIT", 45.0),
+        rate_limit_backoff_base_seconds=_positive_float(file_values, "NANGO_MCP_RATE_LIMIT_BACKOFF_BASE", 1.0),
+        rate_limit_retry_ceiling_seconds=_positive_float(file_values, "NANGO_MCP_RATE_LIMIT_CEILING", 30.0),
+        environment_max_concurrency=_positive_int(file_values, "NANGO_MCP_ENVIRONMENT_MAX_CONCURRENCY", 4),
+        environment_acquire_timeout_seconds=_positive_float(
+            file_values, "NANGO_MCP_ENVIRONMENT_ACQUIRE_TIMEOUT", 30.0
+        ),
+        http_max_connections=_positive_int(file_values, "NANGO_MCP_HTTP_MAX_CONNECTIONS", 40),
+        http_max_keepalive=_positive_int(file_values, "NANGO_MCP_HTTP_MAX_KEEPALIVE", 10),
+        artifact_root=_value(file_values, "NANGO_MCP_ARTIFACT_ROOT"),
+        artifact_max_bytes=_positive_int(file_values, "NANGO_MCP_ARTIFACT_MAX_BYTES", 50 * 1024 * 1024),
+        artifact_ttl_seconds=_positive_int(file_values, "NANGO_MCP_ARTIFACT_TTL_SECONDS", 24 * 60 * 60),
     )
