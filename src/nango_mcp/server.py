@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -79,7 +80,11 @@ def _runtime() -> tuple[Settings, SecretResolver, NangoClient]:
     if _resolver is None:
         _resolver = build_secret_resolver(_settings)
     if _nango is None:
-        _nango = NangoClient(_settings.nango_url, timeout=_settings.request_timeout)
+        _nango = NangoClient(
+            _settings.nango_url,
+            timeout=_settings.request_timeout,
+            public_base_url=_settings.public_nango_url,
+        )
     return _settings, _resolver, _nango
 
 
@@ -171,11 +176,14 @@ def _integration_update_contains_scope_change(fields: dict[str, Any]) -> bool:
 
 
 def _normalized_scope_value(value: Any) -> Any:
+    """Return the comma-delimited scope representation required by Nango."""
     if isinstance(value, list):
-        return [str(item).strip() for item in value]
-    if isinstance(value, str):
-        return value.strip()
-    return value
+        candidates = [str(item).strip() for item in value]
+    elif isinstance(value, str):
+        candidates = re.split(r"[\s,]+", value.strip())
+    else:
+        return value
+    return ",".join(dict.fromkeys(item for item in candidates if item))
 
 
 def _prepare_integration_update_fields(
@@ -207,17 +215,22 @@ def _prepare_integration_update_fields(
                 )
         if "scopes" in credentials and _normalized_scope_value(credentials["scopes"]) != selected_normalized:
             raise ValueError("conflicting scope values supplied at top level and credentials.scopes")
-        credentials["scopes"] = selected_value
+        credentials["scopes"] = selected_normalized
         notes.append(
             "Moved top-level scope field(s) into credentials.scopes; Nango rejects top-level "
             "scopes/oauth_scopes/default_scopes on integration PATCH."
         )
 
     if "scopes" in credentials:
+        credentials["scopes"] = _normalized_scope_value(credentials["scopes"])
         current = _as_data_dict(current_integration or {})
         current_credentials = current.get("credentials")
         if isinstance(current_credentials, dict):
-            merged_credentials = dict(current_credentials)
+            merged_credentials = {
+                key: value
+                for key, value in current_credentials.items()
+                if not _field_is_blank(value)
+            }
             merged_credentials.update({key: value for key, value in credentials.items() if not _field_is_blank(value)})
             credentials = merged_credentials
 
@@ -552,6 +565,43 @@ async def get_connection(
 
 
 @mcp.tool()
+async def refresh_connection_credentials(
+    environment: str,
+    connection_id: str,
+    provider_config_key: str,
+    confirmation: str = "",
+) -> dict[str, Any]:
+    """Force an OAuth refresh and return only a non-secret credential summary."""
+    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    _, nango, secret = await _resolve(environment)
+    response = await nango.get_connection(
+        secret.nango_secret_key,
+        connection_id,
+        provider_config_key,
+        include_credentials=True,
+        force_refresh=True,
+    )
+    credentials = response.get("credentials", {}) if isinstance(response, dict) else {}
+    if not isinstance(credentials, dict):
+        credentials = {}
+    raw_credentials = credentials.get("raw", {})
+    if not isinstance(raw_credentials, dict):
+        raw_credentials = {}
+    return {
+        "connection_id": connection_id,
+        "provider_config_key": provider_config_key,
+        "refreshed": True,
+        "credential_summary": {
+            "has_access_token": bool(credentials.get("access_token")),
+            "has_refresh_token": bool(credentials.get("refresh_token")),
+            "token_type": credentials.get("token_type") or raw_credentials.get("token_type"),
+            "scope": credentials.get("scope") or raw_credentials.get("scope"),
+            "expires_at": credentials.get("expires_at") or raw_credentials.get("expires_at"),
+        },
+    }
+
+
+@mcp.tool()
 async def get_connection_context(
     environment: str,
     connection_id: str,
@@ -688,9 +738,10 @@ async def create_standard_connect_session(
     display_name: str | None = None,
     email: str | None = None,
     integrations_config_defaults: dict[str, Any] | None = None,
+    oauth_app_owner: str | None = None,
     confirmation: str = "",
 ) -> Any:
-    """Create a Connect session with recommended Nango tags plus optional MCP convention tags."""
+    """Create a Connect session and return its post-auth finalization contract."""
     _assert_confirmation(confirmation, WRITE_CONFIRMATION)
     tags = convention_tags(
         environment,
@@ -707,7 +758,28 @@ async def create_standard_connect_session(
 
     _, nango, secret = await _resolve(environment)
     response = sanitize_response(await nango.create_connect_session(secret.nango_secret_key, payload))
-    return {"tags": tags, "response": response}
+    settings, _, _ = _runtime()
+    return {
+        "tags": tags,
+        "post_auth_finalization": {
+            "provider_config_key": provider_config_key,
+            "principal": principal.strip(),
+            "owner_kind": owner_kind,
+            "purpose": purpose,
+            "oauth_app_owner": oauth_app_owner,
+            "display_name": display_name.strip() if display_name else principal.strip(),
+            "email": email.strip() if email else None,
+            "metadata": convention_metadata(
+                environment,
+                principal,
+                owner_kind,
+                purpose,
+                namespace=settings.metadata_namespace,
+                oauth_app_owner=oauth_app_owner,
+            ),
+        },
+        "response": response,
+    }
 
 
 @mcp.tool()
@@ -792,6 +864,8 @@ async def apply_connection_convention(
     purpose: str,
     oauth_app_owner: str | None = None,
     patch_metadata: bool = True,
+    display_name: str | None = None,
+    email: str | None = None,
     confirmation: str = "",
 ) -> dict[str, Any]:
     """Apply suggested Nango MCP tags and metadata to an existing connection."""
@@ -809,6 +883,15 @@ async def apply_connection_convention(
     existing = await nango.get_connection(secret.nango_secret_key, connection_id, provider_config_key)
     existing_tags = existing.get("tags") if isinstance(existing, dict) else None
     merged_tags = {**(existing_tags or {}), **tags}
+    existing_end_user = existing.get("end_user") if isinstance(existing, dict) else None
+    if not isinstance(existing_end_user, dict):
+        existing_end_user = {}
+    projected_display_name = display_name.strip() if display_name else existing_end_user.get("display_name")
+    projected_email = email.strip() if email else existing_end_user.get("email")
+    if projected_display_name:
+        merged_tags["end_user_display_name"] = projected_display_name
+    if projected_email:
+        merged_tags["end_user_email"] = projected_email
     tag_response = await nango.patch_connection_tags(
         secret.nango_secret_key,
         connection_id,
@@ -824,6 +907,10 @@ async def apply_connection_convention(
     )
     return {
         "tags": merged_tags,
+        "identity_projection": {
+            "display_name": projected_display_name,
+            "email": projected_email,
+        },
         "metadata": metadata,
         "tag_response": sanitize_response(tag_response),
         "metadata_response": sanitize_response(metadata_response),

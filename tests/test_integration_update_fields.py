@@ -17,6 +17,7 @@ def test_scope_update_moves_top_level_scope_alias_into_credentials() -> None:
                     "type": "OAUTH2",
                     "client_id": "client-id",
                     "client_secret": "client-secret",
+                    "webhook_secret": None,
                 }
             }
         },
@@ -33,6 +34,48 @@ def test_scope_update_moves_top_level_scope_alias_into_credentials() -> None:
     }
     assert any("credentials.scopes" in note for note in notes)
     assert any("must reconnect" in note for note in notes)
+
+
+def test_scope_update_preserves_nonblank_current_webhook_secret() -> None:
+    prepared, _ = _prepare_integration_update_fields(
+        {"scopes": "scope.one scope.two"},
+        {
+            "data": {
+                "credentials": {
+                    "type": "OAUTH2",
+                    "client_id": "client-id",
+                    "client_secret": "client-secret",
+                    "webhook_secret": "webhook-secret",
+                }
+            }
+        },
+    )
+
+    assert prepared["credentials"]["scopes"] == "scope.one,scope.two"
+    assert prepared["credentials"]["webhook_secret"] == "webhook-secret"
+
+
+@pytest.mark.parametrize(
+    ("scope_input", "expected"),
+    [
+        ("openid profile email", "openid,profile,email"),
+        (["openid", "profile", "openid"], "openid,profile"),
+    ],
+)
+def test_scope_update_normalizes_supported_input_shapes(scope_input, expected) -> None:
+    prepared, _ = _prepare_integration_update_fields(
+        {"scopes": scope_input},
+        {
+            "data": {
+                "credentials": {
+                    "client_id": "client-id",
+                    "client_secret": "client-secret",
+                }
+            }
+        },
+    )
+
+    assert prepared["credentials"]["scopes"] == expected
 
 
 def test_scope_update_rejects_conflicting_scope_values() -> None:

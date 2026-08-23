@@ -35,6 +35,7 @@ class InfisicalSettings:
 class Settings:
     nango_url: str
     environments: tuple[EnvironmentConfig, ...]
+    public_nango_url: str | None = None
     secret_resolver: str = "direct"
     metadata_namespace: str = DEFAULT_METADATA_NAMESPACE
     request_timeout: float = 20.0
@@ -156,6 +157,9 @@ def load_settings() -> Settings:
 
     return Settings(
         nango_url=_value(file_values, "NANGO_BASE_URL", "NANGO_MCP_NANGO_URL", default=DEFAULT_NANGO_URL).rstrip("/"),
+        public_nango_url=(
+            _value(file_values, "NANGO_MCP_PUBLIC_NANGO_URL") or None
+        ),
         environments=_load_environments(file_values, secret_resolver),
         secret_resolver=secret_resolver,
         metadata_namespace=_value(

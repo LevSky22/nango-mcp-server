@@ -21,8 +21,15 @@ SAFE_RESPONSE_HEADER_PREFIXES = ("ratelimit", "x-ratelimit")
 
 
 class NangoClient:
-    def __init__(self, base_url: str, timeout: float = 20.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 20.0,
+        *,
+        public_base_url: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.public_base_url = (public_base_url or base_url).rstrip("/")
         self.timeout = timeout
 
     def _parse_response_body(self, response: httpx.Response) -> Any:
@@ -83,7 +90,7 @@ class NangoClient:
     def _with_self_hosted_api_url(self, connect_link: str) -> str:
         parts = urlsplit(connect_link)
         query = dict(parse_qsl(parts.query, keep_blank_values=True))
-        query.setdefault("apiURL", self.base_url)
+        query["apiURL"] = self.public_base_url
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
     def _normalize_connect_session_response(self, response: Any) -> Any:
@@ -169,10 +176,14 @@ class NangoClient:
         connection_id: str,
         provider_config_key: str,
         include_credentials: bool = False,
+        *,
+        force_refresh: bool = False,
     ) -> Any:
         params: dict[str, Any] = {"provider_config_key": provider_config_key}
         if include_credentials:
-            params["include_credentials"] = "true"
+            params["refresh_token"] = "true"
+        if force_refresh:
+            params["force_refresh"] = "true"
         return await self._request(secret_key, "GET", f"/connections/{connection_id}", params=params)
 
     async def import_connection(self, secret_key: str, payload: dict[str, Any]) -> Any:
