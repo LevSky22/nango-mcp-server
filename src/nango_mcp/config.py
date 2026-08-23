@@ -70,6 +70,14 @@ class Settings:
     request_state_keys: tuple[str, ...] = ()
     request_state_ttl_seconds: int = DEFAULT_REQUEST_STATE_TTL_SECONDS
     oauth: OAuthSettings | None = None
+    rate_limit_max_attempts: int = 4
+    rate_limit_max_wait_seconds: float = 45.0
+    rate_limit_backoff_base_seconds: float = 1.0
+    rate_limit_retry_ceiling_seconds: float = 30.0
+    environment_max_concurrency: int = 4
+    environment_acquire_timeout_seconds: float = 30.0
+    http_max_connections: int = 40
+    http_max_keepalive: int = 10
 
 
 def env_key_for_slug(slug: str) -> str:
@@ -115,6 +123,17 @@ def _timeout(values: dict[str, str]) -> float:
         return float(raw)
     except ValueError:
         return 20.0
+
+
+def _positive_float(values: dict[str, str], name: str, default: float) -> float:
+    raw = _value(values, name, default=str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive number") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive number")
+    return value
 
 
 def _positive_int(values: dict[str, str], name: str, default: int) -> int:
@@ -297,4 +316,14 @@ def load_settings() -> Settings:
         request_state_keys=request_state_keys,
         request_state_ttl_seconds=request_state_ttl,
         oauth=_load_oauth(file_values, transport, auth_mode),
+        rate_limit_max_attempts=_positive_int(file_values, "NANGO_MCP_RATE_LIMIT_MAX_ATTEMPTS", 4),
+        rate_limit_max_wait_seconds=_positive_float(file_values, "NANGO_MCP_RATE_LIMIT_MAX_WAIT", 45.0),
+        rate_limit_backoff_base_seconds=_positive_float(file_values, "NANGO_MCP_RATE_LIMIT_BACKOFF_BASE", 1.0),
+        rate_limit_retry_ceiling_seconds=_positive_float(file_values, "NANGO_MCP_RATE_LIMIT_CEILING", 30.0),
+        environment_max_concurrency=_positive_int(file_values, "NANGO_MCP_ENVIRONMENT_MAX_CONCURRENCY", 4),
+        environment_acquire_timeout_seconds=_positive_float(
+            file_values, "NANGO_MCP_ENVIRONMENT_ACQUIRE_TIMEOUT", 30.0
+        ),
+        http_max_connections=_positive_int(file_values, "NANGO_MCP_HTTP_MAX_CONNECTIONS", 40),
+        http_max_keepalive=_positive_int(file_values, "NANGO_MCP_HTTP_MAX_KEEPALIVE", 10),
     )

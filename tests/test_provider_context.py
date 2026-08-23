@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import nango_mcp.server as server
+from nango_mcp.auth import CallerScope, reset_scope, set_scope
 from nango_mcp.server import _as_data_list, _provider_summary
 
 
@@ -37,6 +38,16 @@ def test_as_data_list_accepts_wrapped_or_raw_lists() -> None:
     assert _as_data_list({"data": {"name": "github"}}) == []
 
 
+def test_proxy_schema_is_strict_camel_case() -> None:
+    tool = server.mcp._tool_manager.get_tool("proxy_request")
+    assert tool.parameters["additionalProperties"] is False
+    properties = tool.parameters["properties"]
+    assert "providerConfigKey" in properties
+    assert "connectionId" in properties
+    assert "baseUrlOverride" in properties
+    assert "provider_config_key" not in properties
+
+
 @pytest.mark.asyncio
 async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"value": [{"subject": "Quote request", "from": {"emailAddress": {"address": "lead@example.test"}}}]}
@@ -53,30 +64,34 @@ async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: 
 
     monkeypatch.setattr(server, "_resolve", fake_resolve)
 
-    text = await server.proxy_request(
-        "prod",
-        "microsoft-entra-id",
-        "service",
-        "GET",
-        "/v1.0/me/messages",
-    )
+    scope_token = set_scope(CallerScope("test", frozenset({"prod"})))
+    try:
+        result = await server.proxy_request(
+            None,
+            "prod",
+            "microsoft-entra-id",
+            "service",
+            "GET",
+            "/v1.0/me/messages",
+        )
 
-    assert isinstance(text, str)
-    assert json.loads(text) == envelope
-    assert '"status": 200' in text
-    assert '"value": [' in text
-    assert calls[0]["kwargs"]["base_url_override"] is None
+        assert result["status"] == 200
+        assert result["contentType"] == "application/json"
+        assert result["response"] == payload
+        assert calls[0]["kwargs"]["base_url_override"] is None
 
-    mcp_result = await server.mcp.call_tool(
-        "proxy_request",
-        {
-            "environment": "prod",
-            "provider_config_key": "microsoft-entra-id",
-            "connection_id": "service",
-            "method": "GET",
-            "path": "/v1.0/me/messages",
-            "base_url_override": "https://graph.microsoft.com",
-        },
-    )
-    assert json.loads(mcp_result.content[0].text) == envelope
-    assert calls[1]["kwargs"]["base_url_override"] == "https://graph.microsoft.com"
+        mcp_result = await server.mcp.call_tool(
+            "proxy_request",
+            {
+                "environment": "prod",
+                "providerConfigKey": "microsoft-entra-id",
+                "connectionId": "service",
+                "method": "GET",
+                "path": "/v1.0/me/messages",
+                "baseUrlOverride": "https://graph.microsoft.com",
+            },
+        )
+        assert mcp_result.structured_content["response"] == payload
+        assert calls[1]["kwargs"]["base_url_override"] == "https://graph.microsoft.com"
+    finally:
+        reset_scope(scope_token)

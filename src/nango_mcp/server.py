@@ -28,7 +28,9 @@ from .auth import (
     TokenRegistry,
     TokenRegistrySource,
     authenticate,
+    authorize_operation,
     permitted_environments,
+    proxy_route_matches,
     require_scope,
     reset_scope,
     set_scope,
@@ -45,6 +47,7 @@ from .conventions import (
 )
 from .nango import NangoClient
 from .oauth import OAuthIntrospectionVerifier, caller_scope_from_access_token
+from .ratelimit import EnvironmentConcurrencyGate, current_environment
 from .secrets import ResolvedNangoSecret, SecretResolver, build_secret_resolver
 
 
@@ -119,10 +122,11 @@ mcp = MCPServer(
 _settings: Settings | None = None
 _resolver: SecretResolver | None = None
 _nango: NangoClient | None = None
+_environment_gate: EnvironmentConcurrencyGate | None = None
 
 
 def _runtime() -> tuple[Settings, SecretResolver, NangoClient]:
-    global _settings, _resolver, _nango
+    global _settings, _resolver, _nango, _environment_gate
     if _settings is None:
         _settings = load_settings()
     if _resolver is None:
@@ -132,6 +136,17 @@ def _runtime() -> tuple[Settings, SecretResolver, NangoClient]:
             _settings.nango_url,
             timeout=_settings.request_timeout,
             public_base_url=_settings.public_nango_url,
+            rate_limit_max_attempts=_settings.rate_limit_max_attempts,
+            rate_limit_max_wait=_settings.rate_limit_max_wait_seconds,
+            rate_limit_backoff_base=_settings.rate_limit_backoff_base_seconds,
+            rate_limit_ceiling=_settings.rate_limit_retry_ceiling_seconds,
+            max_connections=_settings.http_max_connections,
+            max_keepalive=_settings.http_max_keepalive,
+        )
+    if _environment_gate is None:
+        _environment_gate = EnvironmentConcurrencyGate(
+            _settings.environment_max_concurrency,
+            _settings.environment_acquire_timeout_seconds,
         )
     return _settings, _resolver, _nango
 
@@ -385,6 +400,12 @@ MUTATION_EFFECTS = {
 }
 
 
+def _mutation_effect(tool: str, args: tuple[Any, ...]) -> str:
+    if tool == "proxy_request":
+        return "destructive" if len(args) > 2 and str(args[2]).upper() == "DELETE" else "elevated"
+    return MUTATION_EFFECTS[tool]
+
+
 class MutationApprovalError(PermissionError):
     pass
 
@@ -412,8 +433,10 @@ def _approval_message(tool: str, environment: str, args: tuple[Any, ...]) -> str
         "set_connection_metadata", "create_reconnect_session", "apply_connection_convention",
     } and len(args) >= 2:
         target = f" connection={args[0]} integration={args[1]}"
+    elif tool == "proxy_request" and len(args) >= 4:
+        target = f" method={str(args[2]).upper()} path={args[3]} integration={args[0]} connection={args[1]}"
     return (
-        f"Approve Nango mutation: effect={MUTATION_EFFECTS[tool]} "
+        f"Approve Nango mutation: effect={_mutation_effect(tool, args)} "
         f"environment={environment} tool={tool}{target}"
     )
 
@@ -446,7 +469,7 @@ def _input_required(
             "v": 1,
             "tool": tool,
             "environment": environment,
-            "effect": MUTATION_EFFECTS[tool],
+            "effect": _mutation_effect(tool, args),
             "snapshot": snapshot,
             "requestHash": _approval_hash(tool, environment, args),
         },
@@ -481,8 +504,14 @@ async def _authorize_mutation(
         return None
     _assert_writable()
     caller = require_scope()
-    if caller.mutation_approval == "host" and MUTATION_EFFECTS[tool] != "destructive":
-        return None
+    if caller.mutation_approval == "host" and _mutation_effect(tool, args) != "destructive":
+        if tool != "proxy_request" or not proxy_route_matches(
+            caller.server_approval_proxy_path_patterns,
+            provider_config_key=str(args[0]),
+            method=str(args[2]),
+            path=str(args[3]),
+        ):
+            return None
     snapshot = await _target_snapshot(tool, environment, args)
     if ctx.protocol_version not in MODERN_PROTOCOL_VERSIONS:
         session = ctx.request_context.session
@@ -505,7 +534,7 @@ async def _authorize_mutation(
         "v": 1,
         "tool": tool,
         "environment": environment,
-        "effect": MUTATION_EFFECTS[tool],
+        "effect": _mutation_effect(tool, args),
         "requestHash": _approval_hash(tool, environment, args),
     }
     if any(state.get(key) != value for key, value in expected.items()):
@@ -1038,32 +1067,83 @@ async def create_reconnect_session(
     )
 
 
-@mcp.tool(structured_output=False)
+def _camelize_owned_envelope(value: dict[str, Any]) -> dict[str, Any]:
+    """Camel-case MCP-owned envelope keys while preserving provider JSON verbatim."""
+    mapping = {
+        "content_type": "contentType",
+        "response_headers": "responseHeaders",
+        "rate_limit": "rateLimit",
+    }
+    result = {mapping.get(key, key): child for key, child in value.items()}
+    rate_limit = result.get("rateLimit")
+    if isinstance(rate_limit, dict):
+        result["rateLimit"] = {
+            re.sub(r"_([a-z])", lambda match: match.group(1).upper(), str(key)): child
+            for key, child in rate_limit.items()
+        }
+    return result
+
+
+@mcp.tool(structured_output=True)
 async def proxy_request(
+    ctx: Context,
     environment: str,
-    provider_config_key: str,
-    connection_id: str,
+    providerConfigKey: str,
+    connectionId: str,
     method: str,
     path: str,
     query: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
-    base_url_override: str | None = None,
+    baseUrlOverride: str | None = None,
     body: Any | None = None,
-) -> str:
+    responseMode: str = "auto",
+    responsePath: str | None = None,
+    fields: list[str] | None = None,
+    filters: list[dict[str, Any]] | None = None,
+    pageSize: int = 20,
+    cursor: str | None = None,
+) -> dict[str, Any] | InputRequiredResult:
     """Call a provider API through the Nango Proxy without exposing provider tokens."""
-    _, nango, secret = await _resolve(environment)
-    response = await nango.proxy_request(
-        secret.nango_secret_key,
-        provider_config_key,
-        connection_id,
-        method,
-        path,
-        query=query,
-        headers=headers,
-        base_url_override=base_url_override,
-        body=body,
+    normalized_method = method.strip().upper()
+    caller = require_scope()
+    authorize_operation(
+        caller,
+        "proxy_request",
+        provider_config_key=providerConfigKey,
+        method=normalized_method,
+        path=path,
     )
-    return json_response_text(response)
+    mutation_args = (
+        providerConfigKey, connectionId, normalized_method, path, query, headers,
+        baseUrlOverride, body,
+    )
+    if normalized_method not in {"GET", "HEAD"}:
+        approval = await _authorize_mutation(ctx, "proxy_request", environment, mutation_args)
+        if approval:
+            return approval
+    if responseMode not in {"auto", "inline", "artifact"}:
+        raise ValueError("responseMode must be auto, inline, or artifact")
+    if responsePath is not None or fields is not None or filters is not None or cursor is not None or pageSize != 20:
+        raise ValueError("response shaping requires artifact query support")
+    _, nango, secret = await _resolve(environment)
+    environment_token = current_environment.set(environment)
+    try:
+        gate = _environment_gate or EnvironmentConcurrencyGate(4, 30.0)
+        async with gate.acquire(environment):
+            response = await nango.proxy_request(
+                secret.nango_secret_key,
+                providerConfigKey,
+                connectionId,
+                normalized_method,
+                path,
+                query=query,
+                headers=headers,
+                base_url_override=baseUrlOverride,
+                body=body,
+            )
+    finally:
+        current_environment.reset(environment_token)
+    return _camelize_owned_envelope(response)
 
 
 @mcp.tool()
@@ -1192,6 +1272,20 @@ async def audit_connection_conventions(environment: str, limit: int = 100) -> di
         "healthy": not any(item["required_issues"] for item in findings),
         "findings": findings,
     }
+
+
+def _enforce_strict_tool_arguments(*names: str) -> None:
+    for name in names:
+        tool = mcp._tool_manager.get_tool(name)  # type: ignore[attr-defined]
+        if tool is None:
+            raise RuntimeError(f"cannot harden unregistered MCP tool {name}")
+        argument_model = tool.fn_metadata.arg_model
+        argument_model.model_config["extra"] = "forbid"
+        argument_model.model_rebuild(force=True)
+        tool.parameters = argument_model.model_json_schema(by_alias=True)
+
+
+_enforce_strict_tool_arguments("proxy_request")
 
 
 def _audit_event(*, caller: str, outcome: str, duration_ms: int, tool: str = "unknown") -> None:
