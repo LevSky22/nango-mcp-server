@@ -78,6 +78,9 @@ class Settings:
     environment_acquire_timeout_seconds: float = 30.0
     http_max_connections: int = 40
     http_max_keepalive: int = 10
+    artifact_root: str = ""
+    artifact_max_bytes: int = 50 * 1024 * 1024
+    artifact_ttl_seconds: int = 24 * 60 * 60
 
 
 def env_key_for_slug(slug: str) -> str:
@@ -326,4 +329,7 @@ def load_settings() -> Settings:
         ),
         http_max_connections=_positive_int(file_values, "NANGO_MCP_HTTP_MAX_CONNECTIONS", 40),
         http_max_keepalive=_positive_int(file_values, "NANGO_MCP_HTTP_MAX_KEEPALIVE", 10),
+        artifact_root=_value(file_values, "NANGO_MCP_ARTIFACT_ROOT"),
+        artifact_max_bytes=_positive_int(file_values, "NANGO_MCP_ARTIFACT_MAX_BYTES", 50 * 1024 * 1024),
+        artifact_ttl_seconds=_positive_int(file_values, "NANGO_MCP_ARTIFACT_TTL_SECONDS", 24 * 60 * 60),
     )

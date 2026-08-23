@@ -60,7 +60,13 @@ async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: 
             return envelope
 
     async def fake_resolve(environment: str):
-        return None, FakeNango(), SimpleNamespace(environment=environment, nango_secret_key="nango-secret")
+        settings = SimpleNamespace(
+            request_state_keys=(),
+            artifact_root="",
+            artifact_ttl_seconds=86400,
+            artifact_max_bytes=50 * 1024 * 1024,
+        )
+        return settings, FakeNango(), SimpleNamespace(environment=environment, nango_secret_key="nango-secret")
 
     monkeypatch.setattr(server, "_resolve", fake_resolve)
 
@@ -75,9 +81,10 @@ async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: 
             "/v1.0/me/messages",
         )
 
-        assert result["status"] == 200
-        assert result["contentType"] == "application/json"
-        assert result["response"] == payload
+        structured = result.structured_content
+        assert structured["status"] == 200
+        assert structured["contentType"] == "application/json"
+        assert structured["response"] == payload
         assert calls[0]["kwargs"]["base_url_override"] is None
 
         mcp_result = await server.mcp.call_tool(

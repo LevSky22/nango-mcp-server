@@ -6,7 +6,9 @@ import os
 import re
 import secrets
 import hashlib
+import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -16,7 +18,15 @@ from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import Context
 from mcp.server.request_state import RequestStateSecurity
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp_types import ElicitRequest, ElicitRequestFormParams, ElicitResult, InputRequiredResult
+from mcp_types import (
+    CallToolResult,
+    ElicitRequest,
+    ElicitRequestFormParams,
+    ElicitResult,
+    InputRequiredResult,
+    ResourceLink,
+    TextContent,
+)
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import BaseModel, Field
 from starlette.requests import Request
@@ -48,6 +58,7 @@ from .conventions import (
 from .nango import NangoClient
 from .oauth import OAuthIntrospectionVerifier, caller_scope_from_access_token
 from .ratelimit import EnvironmentConcurrencyGate, current_environment
+from .response_safety import ArtifactStore, bound_proxy_response
 from .secrets import ResolvedNangoSecret, SecretResolver, build_secret_resolver
 
 
@@ -1084,7 +1095,44 @@ def _camelize_owned_envelope(value: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-@mcp.tool(structured_output=True)
+def _artifact_store(settings: Settings) -> ArtifactStore:
+    root = settings.artifact_root
+    if not root:
+        uid = getattr(os, "getuid", lambda: 0)()
+        root = str(Path(tempfile.gettempdir()) / f"nango-mcp-{uid}" / "artifacts")
+    key = settings.request_state_keys[0] if settings.request_state_keys else _state_keys[0]
+    return ArtifactStore(
+        root,
+        "nango-mcp://artifact",
+        key,
+        settings.artifact_ttl_seconds,
+        settings.artifact_max_bytes,
+    )
+
+
+def _artifact_tool_result(result: dict[str, Any]) -> CallToolResult:
+    meta = result.get("responseMeta")
+    artifact = meta.get("artifact") if isinstance(meta, dict) else None
+    content: list[Any] = [
+        TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    ]
+    if isinstance(artifact, dict) and artifact.get("uri"):
+        content.append(
+            ResourceLink(
+                name=f"Nango response {artifact['id']}",
+                uri=artifact["uri"],
+                mimeType=artifact["mediaType"],
+                size=artifact["byteLength"],
+                description="Complete immutable provider response envelope",
+            )
+        )
+    return CallToolResult(
+        content=content,
+        structuredContent=result,
+    )
+
+
+@mcp.tool(structured_output=False)
 async def proxy_request(
     ctx: Context,
     environment: str,
@@ -1102,7 +1150,7 @@ async def proxy_request(
     filters: list[dict[str, Any]] | None = None,
     pageSize: int = 20,
     cursor: str | None = None,
-) -> dict[str, Any] | InputRequiredResult:
+) -> Any:
     """Call a provider API through the Nango Proxy without exposing provider tokens."""
     normalized_method = method.strip().upper()
     caller = require_scope()
@@ -1123,9 +1171,7 @@ async def proxy_request(
             return approval
     if responseMode not in {"auto", "inline", "artifact"}:
         raise ValueError("responseMode must be auto, inline, or artifact")
-    if responsePath is not None or fields is not None or filters is not None or cursor is not None or pageSize != 20:
-        raise ValueError("response shaping requires artifact query support")
-    _, nango, secret = await _resolve(environment)
+    settings, nango, secret = await _resolve(environment)
     environment_token = current_environment.set(environment)
     try:
         gate = _environment_gate or EnvironmentConcurrencyGate(4, 30.0)
@@ -1143,7 +1189,44 @@ async def proxy_request(
             )
     finally:
         current_environment.reset(environment_token)
-    return _camelize_owned_envelope(response)
+    public_response = _camelize_owned_envelope(response)
+    if public_response.get("rateLimit") is not None:
+        return _artifact_tool_result(public_response)
+    caller = require_scope()
+    key = settings.request_state_keys[0] if settings.request_state_keys else _state_keys[0]
+    bounded = bound_proxy_response(
+        public_response,
+        owner=caller.label,
+        environment=environment,
+        cursor_key=key,
+        store=_artifact_store(settings),
+        response_mode="full" if responseMode == "inline" else responseMode,
+        response_path=responsePath,
+        fields=fields,
+        response_filter=filters,
+        response_page_size=pageSize,
+        response_cursor=cursor,
+    )
+    return _artifact_tool_result(bounded)
+
+
+@mcp.resource(
+    "nango-mcp://artifact/{artifactId}",
+    name="Nango response artifact",
+    description="Authenticated complete provider response envelope",
+    mime_type="application/json",
+)
+def read_response_artifact(artifactId: str) -> str:
+    settings, _, _ = _runtime()
+    caller = require_scope()
+    configured = frozenset(item.slug for item in settings.environments)
+    permitted = permitted_environments(configured, caller)
+    content, _ = _artifact_store(settings).read_authorized(
+        artifactId,
+        owner=caller.label,
+        environments=permitted,
+    )
+    return content.decode("utf-8")
 
 
 @mcp.tool()
