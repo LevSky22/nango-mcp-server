@@ -3,10 +3,26 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+import uvicorn
+from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .auth import (
+    CallerScope,
+    TokenRegistry,
+    TokenRegistrySource,
+    authenticate,
+    permitted_environments,
+    require_scope,
+    reset_scope,
+    set_scope,
+)
 from .config import Settings, load_settings
 from .conventions import (
     SUGGESTED_OAUTH_APP_OWNERS,
@@ -59,8 +75,9 @@ FIELD_GUIDE = {
 }
 
 
-mcp = FastMCP(
+mcp = MCPServer(
     name="Nango MCP Server",
+    version="1.0.0",
     instructions=(
         "Operate one or more Nango environments through the Nango REST API and Proxy. "
         "The default resolver reads Nango secret keys from environment variables or a .env file; "
@@ -90,6 +107,10 @@ def _runtime() -> tuple[Settings, SecretResolver, NangoClient]:
 
 async def _resolve(environment: str, *, refresh: bool = False) -> tuple[Settings, NangoClient, ResolvedNangoSecret]:
     settings, resolver, nango = _runtime()
+    scope = require_scope()
+    configured = frozenset(item.slug for item in settings.environments)
+    if environment not in permitted_environments(configured, scope):
+        raise PermissionError("environment is outside the caller scope")
     secret = await resolver.resolve_nango_secret(environment, refresh=refresh)
     return settings, nango, secret
 
@@ -350,6 +371,10 @@ def list_environments(refresh: bool = False) -> dict[str, Any]:
         "environments": [
             {"environment": item.slug, "accepted_aliases": list(item.aliases)}
             for item in settings.environments
+            if item.slug in permitted_environments(
+                frozenset(environment.slug for environment in settings.environments),
+                require_scope(),
+            )
         ],
         "secret_material_returned": False,
         "refresh_requested": refresh,
@@ -953,5 +978,125 @@ async def audit_connection_conventions(environment: str, limit: int = 100) -> di
     }
 
 
+def _audit_event(*, caller: str, outcome: str, duration_ms: int, tool: str = "unknown") -> None:
+    print(
+        json.dumps(
+            {
+                "event": "mcp_request",
+                "caller": caller,
+                "tool": tool,
+                "outcome": outcome,
+                "durationMs": duration_ms,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+class BearerScopeMiddleware:
+    """Authenticate HTTP requests without logging credentials or payloads."""
+
+    def __init__(self, app: ASGIApp, registry: TokenRegistry | TokenRegistrySource) -> None:
+        self.app = app
+        self.registry = registry
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path") == "/health":
+            await JSONResponse({"status": "ok"})(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        started = time.monotonic()
+        try:
+            registry = self.registry.current() if isinstance(self.registry, TokenRegistrySource) else self.registry
+            caller = authenticate(headers.get("authorization"), registry)
+        except PermissionError:
+            _audit_event(
+                caller="unauthenticated",
+                outcome="auth_failure",
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+            await Response(status_code=401)(scope, receive, send)
+            return
+        except (OSError, RuntimeError):
+            _audit_event(
+                caller="unauthenticated",
+                outcome="policy_failure",
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+            await Response(status_code=503)(scope, receive, send)
+            return
+
+        status_code = 200
+
+        async def capture_status(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+            await send(message)
+
+        scope_token = set_scope(caller)
+        try:
+            await self.app(scope, receive, capture_status)
+        finally:
+            reset_scope(scope_token)
+        if status_code >= 400:
+            _audit_event(
+                caller=caller.label,
+                tool=headers.get("mcp-name", "unknown"),
+                outcome="request_failure" if status_code < 500 else "transport_failure",
+                duration_ms=round((time.monotonic() - started) * 1000),
+            )
+
+
+def create_http_app(
+    settings: Settings,
+    registry: TokenRegistry | TokenRegistrySource | None = None,
+) -> ASGIApp:
+    if settings.auth_mode != "static":
+        raise RuntimeError("OAuth HTTP authentication is configured by the OAuth resource-server adapter")
+    resolved_registry = registry or TokenRegistrySource(
+        settings.token_registry_raw,
+        settings.denied_environments,
+        settings.token_registry_file,
+    )
+
+    @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+    async def health(_: Request) -> Response:
+        return JSONResponse({"status": "ok"})
+
+    app = mcp.streamable_http_app(
+        streamable_http_path="/mcp",
+        stateless_http=False,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=list(settings.http_allowed_hosts),
+            allowed_origins=[],
+        ),
+        host=settings.http_host,
+    )
+    return BearerScopeMiddleware(app, resolved_registry)
+
+
 def main() -> None:
-    mcp.run()
+    settings = load_settings()
+    if settings.transport == "http":
+        uvicorn.run(create_http_app(settings), host=settings.http_host, port=settings.http_port)
+        return
+    implicit = CallerScope(
+        label="local-stdio",
+        environments=frozenset(item.slug for item in settings.environments),
+    )
+    scope_token = set_scope(implicit)
+    try:
+        mcp.run("stdio")
+    finally:
+        reset_scope(scope_token)

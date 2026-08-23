@@ -11,6 +11,9 @@ DEFAULT_ENVIRONMENT = "default"
 DEFAULT_METADATA_NAMESPACE = "nango_mcp"
 DEFAULT_INFISICAL_SECRET_PATH_TEMPLATE = "/nango/{environment}"
 DEFAULT_INFISICAL_SECRET_NAME = "NANGO_SECRET_KEY"
+DEFAULT_REQUEST_STATE_TTL_SECONDS = 15 * 60
+MIN_REQUEST_STATE_TTL_SECONDS = 60
+MAX_REQUEST_STATE_TTL_SECONDS = 60 * 60
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,21 @@ class Settings:
     read_only: bool = False
     require_confirmation: bool = False
     infisical: InfisicalSettings | None = None
+    transport: str = "stdio"
+    http_host: str = "127.0.0.1"
+    http_port: int = 3000
+    http_allowed_hosts: tuple[str, ...] = (
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+        "testserver",
+    )
+    auth_mode: str = "static"
+    token_registry_raw: str = ""
+    token_registry_file: str = ""
+    denied_environments: frozenset[str] = frozenset()
+    request_state_keys: tuple[str, ...] = ()
+    request_state_ttl_seconds: int = DEFAULT_REQUEST_STATE_TTL_SECONDS
 
 
 def env_key_for_slug(slug: str) -> str:
@@ -87,6 +105,24 @@ def _timeout(values: dict[str, str]) -> float:
         return float(raw)
     except ValueError:
         return 20.0
+
+
+def _positive_int(values: dict[str, str], name: str, default: int) -> int:
+    raw = _value(values, name, default=str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return value
+
+
+def _port(values: dict[str, str], name: str, default: int) -> int:
+    value = _positive_int(values, name, default)
+    if value > 65535:
+        raise RuntimeError(f"{name} must be between 1 and 65535")
+    return value
 
 
 def _bool(values: dict[str, str], name: str, *, default: bool = False) -> bool:
@@ -155,6 +191,30 @@ def load_settings() -> Settings:
     if secret_resolver not in {"direct", "infisical"}:
         raise RuntimeError("NANGO_MCP_SECRET_RESOLVER must be 'direct' or 'infisical'")
 
+    transport = _value(file_values, "NANGO_MCP_TRANSPORT", default="stdio").lower()
+    if transport not in {"stdio", "http"}:
+        raise RuntimeError("NANGO_MCP_TRANSPORT must be 'stdio' or 'http'")
+    auth_mode = _value(file_values, "NANGO_MCP_AUTH_MODE", default="static").lower()
+    if auth_mode not in {"static", "oauth"}:
+        raise RuntimeError("NANGO_MCP_AUTH_MODE must be 'static' or 'oauth'")
+    request_state_keys = _csv(_value(file_values, "NANGO_MCP_REQUEST_STATE_KEYS"))
+    request_state_ttl = _positive_int(
+        file_values,
+        "NANGO_MCP_REQUEST_STATE_TTL_SECONDS",
+        DEFAULT_REQUEST_STATE_TTL_SECONDS,
+    )
+    if not MIN_REQUEST_STATE_TTL_SECONDS <= request_state_ttl <= MAX_REQUEST_STATE_TTL_SECONDS:
+        raise RuntimeError(
+            "NANGO_MCP_REQUEST_STATE_TTL_SECONDS must be between "
+            f"{MIN_REQUEST_STATE_TTL_SECONDS} and {MAX_REQUEST_STATE_TTL_SECONDS}"
+        )
+    token_registry_raw = _value(file_values, "NANGO_MCP_TOKENS")
+    token_registry_file = _value(file_values, "NANGO_MCP_TOKEN_REGISTRY_FILE")
+    if transport == "http" and auth_mode == "static" and not (token_registry_raw or token_registry_file):
+        raise RuntimeError(
+            "NANGO_MCP_TOKENS or NANGO_MCP_TOKEN_REGISTRY_FILE is required for static HTTP auth"
+        )
+
     return Settings(
         nango_url=_value(file_values, "NANGO_BASE_URL", "NANGO_MCP_NANGO_URL", default=DEFAULT_NANGO_URL).rstrip("/"),
         public_nango_url=(
@@ -171,4 +231,22 @@ def load_settings() -> Settings:
         read_only=_bool(file_values, "NANGO_MCP_READ_ONLY"),
         require_confirmation=_bool(file_values, "NANGO_MCP_REQUIRE_CONFIRMATION"),
         infisical=_load_infisical(file_values, secret_resolver),
+        transport=transport,
+        http_host=_value(file_values, "NANGO_MCP_HTTP_HOST", default="127.0.0.1"),
+        http_port=_port(file_values, "NANGO_MCP_HTTP_PORT", 3000),
+        http_allowed_hosts=_csv(
+            _value(
+                file_values,
+                "NANGO_MCP_HTTP_ALLOWED_HOSTS",
+                default="127.0.0.1:*,localhost:*,[::1]:*,testserver",
+            )
+        ),
+        auth_mode=auth_mode,
+        token_registry_raw=token_registry_raw,
+        token_registry_file=token_registry_file,
+        denied_environments=frozenset(
+            item.lower() for item in _csv(_value(file_values, "NANGO_MCP_DENY_ENVIRONMENTS"))
+        ),
+        request_state_keys=request_state_keys,
+        request_state_ttl_seconds=request_state_ttl,
     )

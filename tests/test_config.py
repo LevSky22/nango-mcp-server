@@ -69,3 +69,12 @@ def test_load_settings_supports_optional_mutation_guards(tmp_path, monkeypatch: 
 
     assert settings.read_only is True
     assert settings.require_confirmation is True
+
+
+def test_http_static_auth_requires_a_token_registry(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("NANGO_SECRET_KEY=secret_default\nNANGO_MCP_TRANSPORT=http\n")
+    monkeypatch.setenv("NANGO_MCP_ENV_FILE", str(env_file))
+
+    with pytest.raises(RuntimeError, match="TOKEN"):
+        load_settings()

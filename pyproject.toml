@@ -11,13 +11,14 @@ authors = [
 ]
 dependencies = [
   "httpx>=0.28.1,<1",
-  "mcp>=1.27.2,<2",
+  "mcp>=2,<3",
+  "uvicorn>=0.47,<1",
 ]
 
 [project.optional-dependencies]
 test = [
   "pytest>=8,<9",
-  "pytest-asyncio>=0.23,<1",
+  "pytest-asyncio>=1,<2",
 ]
 
 [project.scripts]

@@ -78,6 +78,5 @@ async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: 
             "base_url_override": "https://graph.microsoft.com",
         },
     )
-    assert isinstance(mcp_result, list)
-    assert json.loads(mcp_result[0].text) == envelope
+    assert json.loads(mcp_result.content[0].text) == envelope
     assert calls[1]["kwargs"]["base_url_override"] == "https://graph.microsoft.com"
