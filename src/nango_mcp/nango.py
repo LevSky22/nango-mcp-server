@@ -560,6 +560,7 @@ class NangoClient:
                         if declared_length > max_bytes:
                             raise ValueError(f"provider file exceeds the {max_bytes}-byte download limit")
                     with temporary.open("xb") as output:
+                        os.chmod(temporary, 0o600)
                         async for chunk in response.aiter_bytes():
                             total += len(chunk)
                             if total > max_bytes:

@@ -53,6 +53,11 @@ def test_proxy_schema_is_strict_camel_case() -> None:
     assert {"artifactId", "responsePath", "pageSize", "objectMode", "textSearch"} <= set(query_properties)
     assert "artifact_id" not in query_properties
 
+    download_tool = server.mcp._tool_manager.get_tool("download_provider_file")
+    assert download_tool.parameters["additionalProperties"] is False
+    download_properties = download_tool.parameters["properties"]
+    assert {"providerConfigKey", "connectionId", "baseUrlOverride", "suggestedName"} <= set(download_properties)
+
 
 @pytest.mark.asyncio
 async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: pytest.MonkeyPatch) -> None:

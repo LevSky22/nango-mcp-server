@@ -45,6 +45,7 @@ from .auth import (
     reset_scope,
     set_scope,
 )
+from .binary_resources import BinaryResourceStore
 from .config import Settings, load_settings
 from .conventions import (
     SUGGESTED_OAUTH_APP_OWNERS,
@@ -1110,6 +1111,14 @@ def _artifact_store(settings: Settings) -> ArtifactStore:
     )
 
 
+def _binary_store(settings: Settings) -> BinaryResourceStore:
+    root = settings.artifact_root
+    if not root:
+        uid = getattr(os, "getuid", lambda: 0)()
+        root = str(Path(tempfile.gettempdir()) / f"nango-mcp-{uid}" / "artifacts")
+    return BinaryResourceStore(str(Path(root) / "downloads"), settings.artifact_ttl_seconds)
+
+
 def _artifact_tool_result(result: dict[str, Any]) -> CallToolResult:
     meta = result.get("responseMeta")
     artifact = meta.get("artifact") if isinstance(meta, dict) else None
@@ -1266,6 +1275,99 @@ async def query_response_artifact(
     )
 
 
+@mcp.tool(structured_output=False)
+async def download_provider_file(
+    environment: str,
+    providerConfigKey: str,
+    connectionId: str,
+    path: str,
+    query: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    baseUrlOverride: str | None = None,
+    suggestedName: str | None = None,
+) -> CallToolResult:
+    """Stream a provider GET response into a protected MCP binary resource."""
+    caller = require_scope()
+    authorize_operation(
+        caller,
+        "download_provider_file",
+        provider_config_key=providerConfigKey,
+        method="GET",
+        path=path,
+    )
+    if suggestedName is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", suggestedName):
+        raise ValueError("suggestedName must be a plain 1-120 character filename")
+    settings, nango, secret = await _resolve(environment)
+    store = _binary_store(settings)
+    store.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = store.root / f".incoming-{secrets.token_urlsafe(18)}"
+    safe_headers = {
+        key: value
+        for key, value in (headers or {}).items()
+        if key.lower() not in {"accept", "nango-proxy-accept"}
+    }
+    environment_token = current_environment.set(environment)
+    try:
+        gate = _environment_gate or EnvironmentConcurrencyGate(4, 30.0)
+        async with gate.acquire(environment):
+            metadata = await nango.download_provider_file(
+                secret.nango_secret_key,
+                providerConfigKey,
+                connectionId,
+                path,
+                destination,
+                max_bytes=settings.artifact_max_bytes,
+                query=query,
+                headers=safe_headers,
+                base_url_override=baseUrlOverride,
+            )
+        resource = store.ingest(
+            destination,
+            owner=caller.label,
+            environment=environment,
+            content_type=str(metadata["content_type"]),
+            byte_length=int(metadata["byte_length"]),
+            sha256=str(metadata["sha256"]),
+            suggested_name=suggestedName,
+        )
+    finally:
+        current_environment.reset(environment_token)
+        destination.unlink(missing_ok=True)
+    result = {"ok": True, "status": metadata["status"], "resource": resource}
+    return CallToolResult(
+        content=[
+            TextContent(type="text", text=json.dumps(result, separators=(",", ":"))),
+            ResourceLink(
+                name=suggestedName or f"Provider download {resource['id']}",
+                uri=resource["uri"],
+                mimeType=resource["contentType"],
+                size=resource["byteLength"],
+                description="Complete provider binary response",
+            ),
+        ],
+        structuredContent=result,
+    )
+
+
+@mcp.resource(
+    "nango-mcp://download/{resourceId}",
+    name="Nango provider download",
+    description="Authenticated complete provider binary response",
+    mime_type="application/octet-stream",
+)
+def read_provider_download(resourceId: str) -> bytes:
+    settings, _, _ = _runtime()
+    caller = require_scope()
+    configured = frozenset(item.slug for item in settings.environments)
+    permitted = permitted_environments(configured, caller)
+    content, _ = _binary_store(settings).read_authorized(
+        resourceId,
+        owner=caller.label,
+        environments=permitted,
+    )
+    return content
+
+
 @mcp.tool()
 def build_connection_convention(
     environment: str,
@@ -1405,7 +1507,11 @@ def _enforce_strict_tool_arguments(*names: str) -> None:
         tool.parameters = argument_model.model_json_schema(by_alias=True)
 
 
-_enforce_strict_tool_arguments("proxy_request", "query_response_artifact")
+_enforce_strict_tool_arguments(
+    "proxy_request",
+    "query_response_artifact",
+    "download_provider_file",
+)
 
 
 def _audit_event(*, caller: str, outcome: str, duration_ms: int, tool: str = "unknown") -> None:
