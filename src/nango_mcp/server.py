@@ -9,7 +9,7 @@ import hashlib
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 from mcp.server import MCPServer
@@ -1229,6 +1229,43 @@ def read_response_artifact(artifactId: str) -> str:
     return content.decode("utf-8")
 
 
+@mcp.tool(structured_output=False)
+async def query_response_artifact(
+    environment: str,
+    artifactId: str,
+    responsePath: str | None = None,
+    fields: list[str] | None = None,
+    filters: list[dict[str, Any]] | None = None,
+    pageSize: int = 20,
+    cursor: str | None = None,
+    describe: bool = False,
+    objectMode: Literal["entries"] | None = None,
+    textSearch: dict[str, Any] | None = None,
+) -> CallToolResult:
+    """Query a stored provider response with bounded, strict camelCase controls."""
+    settings, _, _ = await _resolve(environment)
+    caller = require_scope()
+    store = _artifact_store(settings)
+    store.prune()
+    result = store.query(
+        artifactId,
+        owner=caller.label,
+        environment=environment,
+        response_path=responsePath,
+        fields=fields,
+        response_filter=filters,
+        response_page_size=pageSize,
+        cursor=cursor,
+        describe=describe,
+        object_mode=objectMode,
+        text_search=textSearch,
+    )
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))],
+        structuredContent=result,
+    )
+
+
 @mcp.tool()
 def build_connection_convention(
     environment: str,
@@ -1368,7 +1405,7 @@ def _enforce_strict_tool_arguments(*names: str) -> None:
         tool.parameters = argument_model.model_json_schema(by_alias=True)
 
 
-_enforce_strict_tool_arguments("proxy_request")
+_enforce_strict_tool_arguments("proxy_request", "query_response_artifact")
 
 
 def _audit_event(*, caller: str, outcome: str, duration_ms: int, tool: str = "unknown") -> None:

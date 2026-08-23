@@ -47,6 +47,12 @@ def test_proxy_schema_is_strict_camel_case() -> None:
     assert "baseUrlOverride" in properties
     assert "provider_config_key" not in properties
 
+    query_tool = server.mcp._tool_manager.get_tool("query_response_artifact")
+    assert query_tool.parameters["additionalProperties"] is False
+    query_properties = query_tool.parameters["properties"]
+    assert {"artifactId", "responsePath", "pageSize", "objectMode", "textSearch"} <= set(query_properties)
+    assert "artifact_id" not in query_properties
+
 
 @pytest.mark.asyncio
 async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: pytest.MonkeyPatch) -> None:
