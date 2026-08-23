@@ -65,6 +65,14 @@ def caller_scope_from_access_token(access_token: AccessToken) -> CallerScope:
     if not environments:
         raise PermissionError("access token does not grant a Nango environment")
     denied_tools: set[str] = set()
+    if "nango:read" not in scopes:
+        denied_tools.update({
+            "describe_connection_convention", "list_environments", "check_environment",
+            "list_integrations", "get_integration", "search_provider_templates",
+            "list_connections", "get_connection", "get_connection_context",
+            "build_connection_convention", "audit_connection_conventions",
+            "query_response_artifact",
+        })
     if "nango:write" not in scopes:
         denied_tools.update({
             "create_integration", "update_integration", "delete_integration",

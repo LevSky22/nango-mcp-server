@@ -1,153 +1,74 @@
 # Nango MCP Server
 
-Self-hostable admin/operator MCP server for managing one or more Nango environments through the Nango REST API and Proxy.
+A public, self-hostable MCP server for Nango management and provider API access.
 
 Created by Lev Jampolsky at ValStratis.
 
-This project is an independent MCP server for [Nango](https://www.nango.dev/). It is not affiliated with or endorsed by Nango. See the upstream Nango repository at [NangoHQ/nango](https://github.com/NangoHQ/nango) and Nango docs at [nango.dev/docs](https://nango.dev/docs).
+This independent project is not affiliated with or endorsed by Nango. See [Nango](https://www.nango.dev/), the [Nango repository](https://github.com/NangoHQ/nango), and [Nango documentation](https://nango.dev/docs).
 
-It exposes tools for:
+Version 1.0 provides:
 
-- environment checks
-- provider template search
-- integration management
-- connection management
-- connection tags and metadata
-- Connect and reconnect sessions
-- provider API calls through Nango Proxy
-
-The default setup reads Nango secret keys from environment variables or a `.env` file. Infisical is optional.
-
-## Status
-
-This project is early-stage. It has been tested against a self-hosted Nango deployment and may need compatibility adjustments for Nango Cloud or future Nango API changes.
-
-## Why This Exists
-
-Nango already solves OAuth, token refresh, provider auth injection, and proxying. This MCP gives agents and operators a structured control surface for Nango administration and provider API calls without exposing provider tokens to the agent.
-
-It is meant for the operator side of Nango usage: inspecting environments, managing integrations and connections, creating Connect sessions, maintaining tags/metadata, and calling providers through Nango Proxy.
-
-Management API responses are redacted for credential-like fields. `proxy_request` intentionally returns provider response data because that is the requested data plane.
+- stdio by default and optional Streamable HTTP at `/mcp`
+- direct environment secrets or optional Infisical resolution
+- static bearer policies or OAuth protected-resource authorization for HTTP
+- native MCP approval flows for mutations
+- redacted Nango management responses
+- provider requests through Nango Proxy with safe 429 retry behavior
+- bounded structured results, protected response artifacts, and resource links
+- streamed provider downloads exposed as protected MCP resources
 
 ## Install
 
-Recommended for MCP clients:
+Run directly with `uvx`:
 
 ```bash
-uvx --from git+https://github.com/LevSky22/nango-mcp-server.git nango-mcp
+uvx --from git+https://github.com/LevSky22/nango-mcp-server.git@v1.0.0 nango-mcp
 ```
 
-`uvx` is the Python equivalent of the `npx` pattern commonly used by MCP servers: it runs the package in an isolated environment without making you manage a project virtualenv.
-
-This requires `uv` / `uvx` to be installed. If you do not use `uv`, use `pipx` instead.
-
-For a persistent user-level install:
+Or install persistently:
 
 ```bash
-pipx install git+https://github.com/LevSky22/nango-mcp-server.git
+pipx install git+https://github.com/LevSky22/nango-mcp-server.git@v1.0.0
 ```
 
-Then your MCP client can use:
-
-```bash
-nango-mcp
-```
-
-For local development:
+For development:
 
 ```bash
 git clone https://github.com/LevSky22/nango-mcp-server.git
 cd nango-mcp-server
 python3 -m venv .venv
 .venv/bin/pip install -e ".[test]"
+.venv/bin/python -m pytest -q
 ```
 
-Use the virtualenv command path in MCP configs when working from a checkout:
+## Basic stdio configuration
 
-```bash
-/absolute/path/to/nango-mcp-server/.venv/bin/nango-mcp
-```
-
-## Configuration
-
-Create a `.env` file for the MCP server. If you run `nango-mcp` from this project checkout, `.env` can live in the repository root:
-
-```bash
-cp .env.example .env
-chmod 600 .env
-```
-
-If your MCP client launches `nango-mcp` from another working directory, set `NANGO_MCP_ENV_FILE` to an absolute path so the server can find the file reliably:
-
-```bash
-NANGO_MCP_ENV_FILE=/path/to/.env
-```
-
-Single environment:
+Create a private `.env` file:
 
 ```dotenv
 NANGO_BASE_URL=https://api.nango.dev
 NANGO_ENVIRONMENT=default
-NANGO_SECRET_KEY=nango_secret_key_here
+NANGO_SECRET_KEY=replace_with_your_nango_environment_secret_key
 ```
 
-### Finding Your Nango Secret Key
+`NANGO_SECRET_KEY` is the Nango environment secret key, not a provider credential. Keep it server-side and never commit it.
 
-`NANGO_SECRET_KEY` is the Nango environment secret key, not a provider OAuth client secret and not a provider API key.
-
-In the Nango UI:
-
-1. Select the Nango environment you want this MCP server to operate against.
-2. Open that environment's **Environment Settings**.
-3. Copy the **Secret Key**.
-4. Put it in your local `.env` as `NANGO_SECRET_KEY`, or as `NANGO_SECRET_KEY_<ENV>` for a multi-environment setup.
-
-Nango uses this key as the bearer token for backend/API requests. Anyone with this key can operate against that Nango environment, so keep it server-side and never commit it.
-
-Multiple environments:
+For several environments:
 
 ```dotenv
-NANGO_BASE_URL=https://api.nango.dev
-NANGO_MCP_ENVIRONMENTS=dev,prod
-NANGO_SECRET_KEY_DEV=nango_dev_secret_key_here
-NANGO_SECRET_KEY_PROD=nango_prod_secret_key_here
-NANGO_MCP_ENVIRONMENT_ALIASES_PROD=live,production
+NANGO_MCP_ENVIRONMENTS=development,production
+NANGO_SECRET_KEY_DEVELOPMENT=replace_with_development_secret
+NANGO_SECRET_KEY_PRODUCTION=replace_with_production_secret
+NANGO_MCP_ENVIRONMENT_ALIASES_PRODUCTION=live
 ```
 
-Optional settings:
+Point the process at the file when its working directory differs:
 
-```dotenv
-NANGO_MCP_REQUEST_TIMEOUT=20
-NANGO_MCP_METADATA_NAMESPACE=nango_mcp
-NANGO_MCP_READ_ONLY=false
-NANGO_MCP_REQUIRE_CONFIRMATION=false
+```bash
+NANGO_MCP_ENV_FILE=/absolute/path/to/.env nango-mcp
 ```
 
-Set `NANGO_MCP_READ_ONLY=true` to block mutating tools. Set `NANGO_MCP_REQUIRE_CONFIRMATION=true` if you want write/delete tools to require an explicit confirmation phrase on every mutating call.
-
-## Optional Infisical Resolver
-
-Direct `.env` secrets are the default. To resolve `NANGO_SECRET_KEY` values from Infisical instead:
-
-```dotenv
-NANGO_MCP_SECRET_RESOLVER=infisical
-NANGO_MCP_ENVIRONMENTS=dev,prod
-
-INFISICAL_URL=https://infisical.example.com
-INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=...
-INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=...
-NANGO_MCP_INFISICAL_PROJECT_ID=...
-NANGO_MCP_INFISICAL_ENVIRONMENT=prod
-NANGO_MCP_INFISICAL_SECRET_PATH_TEMPLATE=/nango/{environment}
-NANGO_MCP_INFISICAL_SECRET_NAME=NANGO_SECRET_KEY
-```
-
-For environment `prod`, the default template reads secret `NANGO_SECRET_KEY` from `/nango/prod`.
-
-## MCP Client Example
-
-Generic MCP JSON using `uvx`:
+Generic MCP client configuration:
 
 ```json
 {
@@ -156,7 +77,7 @@ Generic MCP JSON using `uvx`:
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/LevSky22/nango-mcp-server.git",
+        "git+https://github.com/LevSky22/nango-mcp-server.git@v1.0.0",
         "nango-mcp"
       ],
       "env": {
@@ -167,101 +88,175 @@ Generic MCP JSON using `uvx`:
 }
 ```
 
-### Codex CLI
+Stdio is the default. It uses a local implicit caller scope over the configured environments. Set `NANGO_MCP_READ_ONLY=true` to disable mutations entirely.
 
-Use Codex's MCP command:
+## Streamable HTTP
+
+HTTP mode binds to loopback by default and requires authentication plus rotating request-state keys:
+
+```dotenv
+NANGO_MCP_TRANSPORT=http
+NANGO_MCP_HTTP_HOST=127.0.0.1
+NANGO_MCP_HTTP_PORT=3000
+NANGO_MCP_REQUEST_STATE_KEYS=replace_with_at_least_32_random_bytes
+```
+
+`GET /health` is an unauthenticated shallow health check. MCP traffic uses `/mcp`.
+
+### Static bearer policy
+
+Static mode is suited to local and private-network deployments. Tokens must start with `nangomcp1_` and contain at least 43 URL-safe random characters. Store only their lowercase SHA-256 digests:
 
 ```bash
-codex mcp add nango \
-  --env NANGO_MCP_ENV_FILE=/absolute/path/to/.env \
-  -- uvx --from git+https://github.com/LevSky22/nango-mcp-server.git nango-mcp
+python -c 'import hashlib; print(hashlib.sha256(input().strip().encode()).hexdigest())'
 ```
 
-Or edit `~/.codex/config.toml` directly:
-
-```toml
-[mcp_servers.nango]
-command = "uvx"
-args = ["--from", "git+https://github.com/LevSky22/nango-mcp-server.git", "nango-mcp"]
-
-[mcp_servers.nango.env]
-NANGO_MCP_ENV_FILE = "/absolute/path/to/.env"
+```dotenv
+NANGO_MCP_AUTH_MODE=static
+NANGO_MCP_TOKENS={"replace_with_sha256_digest":{"label":"local-automation","scopes":["development"],"allowed_proxy_methods":["GET","HEAD"],"mutation_approval":"server"}}
 ```
 
-If you installed with `pipx`, use `command = "nango-mcp"` and remove `args`. Restart Codex after editing the config.
+Policy fields are:
 
-### Claude Code
+- `label`: non-secret audit identity
+- `scopes`: environment names or `['*']`
+- `denied_tools`: optional tool names
+- `allowed_proxy_methods`: methods or `['*']`
+- `denied_proxy_path_patterns`: optional regular expressions
+- `mutation_approval`: `server` or `host`
+- `server_approval_proxy_path_patterns`: routes that remain server-approved
 
-Add the server with Claude Code's MCP command:
+Use `NANGO_MCP_TOKEN_REGISTRY_FILE` instead of inline JSON for atomic hot reloads.
 
-```bash
-claude mcp add --transport stdio \
-  --env NANGO_MCP_ENV_FILE=/absolute/path/to/.env \
-  nango \
-  -- uvx --from git+https://github.com/LevSky22/nango-mcp-server.git nango-mcp
+### OAuth protected-resource mode
+
+OAuth mode expects an external authorization server and validates opaque access tokens through RFC 7662 introspection:
+
+```dotenv
+NANGO_MCP_AUTH_MODE=oauth
+NANGO_MCP_OAUTH_ISSUER_URL=https://identity.example.com
+NANGO_MCP_OAUTH_RESOURCE_URL=https://mcp.example.com/mcp
+NANGO_MCP_OAUTH_INTROSPECTION_URL=https://identity.example.com/oauth/introspect
+NANGO_MCP_OAUTH_CLIENT_ID=nango-mcp-resource-server
+NANGO_MCP_OAUTH_CLIENT_SECRET=replace_with_resource_server_secret
+NANGO_MCP_OAUTH_REQUIRED_SCOPES=nango-mcp
 ```
 
-If you installed with `pipx`, replace everything after `--` with `nango-mcp`. Restart Claude Code, or reload MCP servers if your client supports it.
+Access tokens use these scopes:
 
-### Starter Prompt
+- `nango-mcp`: required base scope
+- `nango:env:<name>` or `nango:env:*`: environment access
+- `nango:read`: read intent
+- `nango:write`: mutation access
+- `nango:proxy`: proxy and download access
 
-After installing, use a read-only prompt first:
+Issuer, resource, and introspection URLs must use HTTPS except for loopback development. The server validates activity, expiry, required scopes, and audience/resource.
+
+## Approvals
+
+Mutation tools use MCP-native approval flows. There are no confirmation-string arguments.
+
+- `mutation_approval=server` asks for server-bound approval on every mutation.
+- `mutation_approval=host` delegates routine writes to host policy.
+- destructive actions always require server approval.
+- matching proxy routes can be forced back to server approval.
+
+Approval state is time-limited and bound to the caller policy, environment, tool, arguments, effect, and current target snapshot. Modern MCP clients receive `input_required`; compatible older sessions use elicitation.
+
+## Large responses and MCP resources
+
+`proxy_request` never emits an unbounded model-facing result. Small JSON responses remain inline. Large responses are stored privately and returned as:
+
+- a bounded preview in `structuredContent`
+- `responseMeta` with completeness, pagination, and artifact metadata
+- a `resource_link` using `nango-mcp://artifact/<id>`
+
+The host can fetch the complete immutable representation with MCP `resources/read`. Models should use `query_response_artifact` for bounded selection, projection, filtering, shape description, pagination, keyed-object entries, or literal text search.
+
+This hybrid follows MCP's separation of concerns: tools initiate computation, resources carry application-controlled context, and resource links let hosts decide whether full content enters model context. See the MCP guidance for [resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources) and [tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools).
+
+Defaults:
+
+- inline target: 32 KiB
+- stored-result preview: 8 KiB
+- hard emitted result limit: 128 KiB
+- artifact limit: 50 MiB
+- artifact TTL: 24 hours
+- artifact quota: 1 GiB
+- artifact directory/file modes: `0700`/`0600`
+
+Override storage with `NANGO_MCP_ARTIFACT_ROOT`, `NANGO_MCP_ARTIFACT_MAX_BYTES`, and `NANGO_MCP_ARTIFACT_TTL_SECONDS`.
+
+`download_provider_file` streams a provider GET with `Accept: */*`, enforces the size limit, computes SHA-256, and returns `nango-mcp://download/<id>` as a protected resource link. Results never expose a server filesystem path.
+
+## Proxy v1 contract
+
+The proxy, artifact-query, and download tools use strict camelCase wire names. Unknown arguments are rejected.
+
+`proxy_request` accepts:
 
 ```text
-Use the nango MCP server. List the configured Nango environments, check the default environment, and list integrations. Do not create, update, delete, or proxy provider requests yet.
+environment, providerConfigKey, connectionId, method, path,
+query, headers, baseUrlOverride, body, responseMode,
+responsePath, fields, filters, pageSize, cursor
 ```
 
-For a multi-environment setup:
+MCP-owned response fields include `contentType`, `responseHeaders`, `rateLimit`, and `responseMeta`. Provider JSON under `response` is preserved exactly.
+
+`query_response_artifact` accepts:
 
 ```text
-Use the nango MCP server. List configured environments, check the prod environment, and list integrations in prod. Do not make write/delete calls.
+environment, artifactId, responsePath, fields, filters,
+pageSize, cursor, describe, objectMode, textSearch
 ```
+
+Paths use RFC 6901 JSON Pointer. `pageSize` defaults to 20 and is capped at 100. Cursors are signed and bound to the caller, environment, artifact, and query view.
+
+Rate-limit handling distinguishes Nango gateway throttles from forwarded provider throttles by Nango's response body. Gateway rejections are safe to retry for any method because they were not forwarded. Provider rejections are replayed only for GET, HEAD, and OPTIONS.
 
 ## Tools
 
-This server exposes 23 tools grouped by workflow:
+The server exposes 26 tools across environment discovery, provider templates, integrations, connections, Connect sessions, metadata conventions, proxy access, artifact queries, and provider downloads. Management responses redact credential-like fields. `refresh_connection_credentials` returns only a non-secret summary.
 
-| Area | Tools | What they do |
-| --- | --- | --- |
-| Environment | `list_environments`, `check_environment` | Show configured Nango environments and verify a secret can be resolved without returning it. |
-| Integrations | `list_integrations`, `get_integration`, `search_provider_templates`, `create_integration`, `update_integration`, `delete_integration` | Inspect provider integrations, find Nango provider templates, and manage integration definitions. |
-| Connections | `list_connections`, `get_connection`, `get_connection_context`, `import_connection`, `delete_connection` | Inspect, summarize, import, or remove authorized provider connections. |
-| Tags and metadata | `patch_connection_tags`, `set_connection_metadata` | Maintain Nango connection tags and metadata for routing, attribution, and app configuration. |
-| Connect sessions | `create_connect_session`, `create_standard_connect_session`, `create_reconnect_session` | Create hosted Connect or reconnect links for users to authorize or repair provider access. |
-| Proxy | `proxy_request` | Call a provider API through Nango Proxy without exposing provider OAuth tokens to the agent. |
-| Conventions | `describe_connection_convention`, `build_connection_convention`, `apply_connection_convention`, `audit_connection_conventions` | Generate and audit optional tag/metadata conventions for cleaner multi-client operations. |
+The connection convention helpers are optional. They generate generic Nango tags and metadata; they are not profiles and do not discover organizations or impose deployment-specific policy.
 
-Read tools redact credential-like fields from Nango management API responses. Mutating tools are available by default; set `NANGO_MCP_READ_ONLY=true` for inspection-only installs, or enable `NANGO_MCP_REQUIRE_CONFIRMATION=true` if your deployment needs an extra phrase-based guard.
+## Optional Infisical resolver
 
-When using `update_integration` to change OAuth scopes, pass scopes under `credentials.scopes`. The MCP also accepts top-level `scopes`, `oauth_scopes`, or `default_scopes` as operator-friendly aliases and normalizes them into the official Nango payload shape. Scope updates preserve existing integration credential fields internally when Nango returns them through `include=credentials`; if those values are unavailable, provide the credential fields in the request. By default, the MCP auto-creates a reconnect session when exactly one existing connection matches the updated integration. Pass `reconnect_connection_ids` when the affected connection ids are known or when an integration has multiple connections.
+```dotenv
+NANGO_MCP_SECRET_RESOLVER=infisical
+NANGO_MCP_ENVIRONMENTS=development,production
+INFISICAL_URL=https://infisical.example.com
+INFISICAL_UNIVERSAL_AUTH_CLIENT_ID=replace_with_machine_identity_id
+INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET=replace_with_machine_identity_secret
+NANGO_MCP_INFISICAL_PROJECT_ID=replace_with_project_id
+NANGO_MCP_INFISICAL_ENVIRONMENT=production
+NANGO_MCP_INFISICAL_SECRET_PATH_TEMPLATE=/nango/{environment}
+NANGO_MCP_INFISICAL_SECRET_NAME=NANGO_SECRET_KEY
+```
 
-`proxy_request` accepts provider-relative paths such as `/v1.0/me`; do not include `/proxy`. It intentionally returns provider response data, because that is the requested data plane.
+## Docker
 
-For Nango Proxy calls that need a provider host override, pass `base_url_override` to `proxy_request`. The server forwards it as Nango's raw `base-url-override` control header. Ordinary provider headers still belong in `headers` and are forwarded as `nango-proxy-*` headers. This matters for provider families where one connection can call multiple hosts, such as a generic Google integration calling `sheets.googleapis.com` instead of its default Google API host.
+Build locally:
 
-## Tags And Metadata
+```bash
+docker build -t nango-mcp:1.0.0 .
+```
 
-This project follows Nango's public guidance:
+HTTP containers must receive the Nango secret configuration, authentication policy, and request-state keys at runtime. Do not bake secrets into an image.
 
-- Use tags for attribution, filtering, routing, and webhook reconciliation.
-- Recommended tags: `end_user_id`, `end_user_email`, `organization_id`.
-- Optional routing tags: `workspace_id`, `project_id`, `environment`.
-- Use metadata for application/function configuration.
-- Do not store credentials in tags or metadata.
-
-The optional convention helpers can generate tags and metadata under `metadata.nango_mcp` by default. Change that namespace with `NANGO_MCP_METADATA_NAMESPACE`.
-
-## Development
-
-Source code lives in `src/nango_mcp/`: the public package/CLI name uses hyphens (`nango-mcp`), while the Python import package uses underscores (`nango_mcp`). The root `server.py` is only a source-checkout launcher; installed MCP clients should use the `nango-mcp` console script.
+## Development and security
 
 ```bash
 python -m pytest -q
+python -m build
+python -m twine check dist/*
 ```
 
-## Security
+CI tests Python 3.11 through 3.13, builds the distribution, checks package metadata, scans Git history for secrets, and scans the filesystem for high/critical vulnerabilities.
 
-Please do not open public issues containing Nango secret keys, provider OAuth tokens, Infisical credentials, customer data, or raw provider API responses. If you need to report a sensitive issue, use a private disclosure channel instead of a public issue.
+Do not put Nango keys, OAuth tokens, Infisical credentials, provider payloads, or customer data in issues, tests, fixtures, logs, or commits. Audit logs contain identities, tool names, outcomes, timing, and bounded operational metadata—not tokens, headers, arguments, or payloads.
+
+See [MIGRATION.md](MIGRATION.md) when upgrading from 0.x.
 
 ## License
 

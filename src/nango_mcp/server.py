@@ -16,7 +16,7 @@ from mcp.server import MCPServer
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import Context
-from mcp.server.request_state import RequestStateSecurity
+from mcp.server.request_state import RequestStateBoundary, RequestStateSecurity
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp_types import (
     CallToolResult,
@@ -116,6 +116,20 @@ def _request_state_principal(_: ServerRequestContext[Any, Any]) -> str:
     return f"{caller.label}:{digest}"
 
 
+class ToolPolicyMiddleware:
+    """Enforce caller tool denials before argument validation or handler execution."""
+
+    async def __call__(self, ctx: ServerRequestContext[Any, Any], call_next: Any) -> Any:
+        if ctx.method == "tools/call":
+            params = ctx.params
+            name = getattr(params, "name", None)
+            if name is None and isinstance(params, dict):
+                name = params.get("name")
+            if isinstance(name, str):
+                authorize_operation(require_scope(), name)
+        return await call_next(ctx)
+
+
 mcp = MCPServer(
     name="Nango MCP Server",
     version="1.0.0",
@@ -129,6 +143,7 @@ mcp = MCPServer(
         ttl=15 * 60,
         bind_principal=_request_state_principal,
     ),
+    middleware=[ToolPolicyMiddleware()],
 )
 
 _settings: Settings | None = None
@@ -516,6 +531,7 @@ async def _authorize_mutation(
         return None
     _assert_writable()
     caller = require_scope()
+    authorize_operation(caller, tool)
     if caller.mutation_approval == "host" and _mutation_effect(tool, args) != "destructive":
         if tool != "proxy_request" or not proxy_route_matches(
             caller.server_approval_proxy_path_patterns,
@@ -1632,6 +1648,21 @@ def create_http_app(
     settings: Settings,
     registry: TokenRegistry | TokenRegistrySource | None = None,
 ) -> ASGIApp:
+    request_state_boundary = next(
+        (
+            middleware
+            for middleware in mcp._lowlevel_server.middleware  # type: ignore[attr-defined]
+            if isinstance(middleware, RequestStateBoundary)
+        ),
+        None,
+    )
+    if request_state_boundary is None:
+        raise RuntimeError("MCP request-state boundary is unavailable")
+    request_state_boundary._security = RequestStateSecurity(  # type: ignore[attr-defined]
+        keys=list(settings.request_state_keys),
+        ttl=settings.request_state_ttl_seconds,
+        bind_principal=_request_state_principal,
+    )
     oauth_verifier: OAuthIntrospectionVerifier | None = None
     if settings.auth_mode == "oauth":
         if settings.oauth is None:
