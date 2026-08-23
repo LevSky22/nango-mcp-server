@@ -18,9 +18,8 @@ async def test_standard_connect_session_returns_generic_finalization(monkeypatch
     settings = SimpleNamespace(metadata_namespace="nango_mcp")
     monkeypatch.setattr(server, "_resolve", fake_resolve)
     monkeypatch.setattr(server, "_runtime", lambda: (settings, None, None))
-    monkeypatch.setattr(server, "_assert_confirmation", lambda *_args: None)
-
     result = await server.create_standard_connect_session(
+        None,
         "staging",
         "example-integration",
         "person@example.test",
@@ -68,9 +67,8 @@ async def test_apply_convention_projects_identity_without_patching_end_user(monk
         )
 
     monkeypatch.setattr(server, "_resolve", fake_resolve)
-    monkeypatch.setattr(server, "_assert_confirmation", lambda *_args: None)
-
     result = await server.apply_connection_convention(
+        None,
         "staging",
         "connection-id",
         "example-integration",
@@ -108,9 +106,8 @@ async def test_refresh_connection_credentials_never_returns_tokens(monkeypatch) 
         return None, FakeNango(), SimpleNamespace(nango_secret_key="fake-secret")
 
     monkeypatch.setattr(server, "_resolve", fake_resolve)
-    monkeypatch.setattr(server, "_assert_confirmation", lambda *_args: None)
-
     result = await server.refresh_connection_credentials(
+        None,
         "staging",
         "connection-id",
         "example-integration",

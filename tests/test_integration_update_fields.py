@@ -182,6 +182,7 @@ async def test_update_integration_auto_reconnects_single_matching_connection(
     monkeypatch.setattr(server, "_resolve", fake_resolve)
 
     response = await server.update_integration(
+        None,
         "prod",
         "zoho-crm",
         {"scopes": "scope.one,scope.two"},

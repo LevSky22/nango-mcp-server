@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import secrets
+import hashlib
 import time
 from typing import Any
 
 import uvicorn
 from mcp.server import MCPServer
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.context import ServerRequestContext
+from mcp.server.mcpserver import Context
+from mcp.server.request_state import RequestStateSecurity
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp_types import ElicitRequest, ElicitRequestFormParams, ElicitResult, InputRequiredResult
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -57,9 +66,6 @@ SECRET_KEY_FRAGMENTS = (
     "token",
 )
 
-WRITE_CONFIRMATION = "I understand this changes the Nango environment"
-DELETE_CONFIRMATION = "I understand this deletes Nango configuration"
-
 OAUTH_AUTH_MODES = {"OAUTH1", "OAUTH2", "OAUTH2_CC"}
 CREDENTIAL_AUTH_MODES = {"API_KEY", "BASIC", "JWT", "SIGNATURE", "APP", "APP_STORE", "CUSTOM", "TWO_STEP"}
 TOP_LEVEL_SCOPE_FIELDS = ("scopes", "oauth_scopes", "default_scopes")
@@ -77,6 +83,24 @@ FIELD_GUIDE = {
 }
 
 
+_state_keys = [
+    key.strip()
+    for key in os.getenv("NANGO_MCP_REQUEST_STATE_KEYS", "").split(",")
+    if key.strip()
+] or [secrets.token_urlsafe(32)]
+
+
+def _request_state_principal(_: ServerRequestContext[Any, Any]) -> str:
+    caller = require_scope()
+    policy = {
+        "label": caller.label,
+        "environments": sorted(caller.environments),
+        "mutationApproval": caller.mutation_approval,
+    }
+    digest = hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return f"{caller.label}:{digest}"
+
+
 mcp = MCPServer(
     name="Nango MCP Server",
     version="1.0.0",
@@ -84,6 +108,11 @@ mcp = MCPServer(
         "Operate one or more Nango environments through the Nango REST API and Proxy. "
         "The default resolver reads Nango secret keys from environment variables or a .env file; "
         "Infisical is optional."
+    ),
+    request_state_security=RequestStateSecurity(
+        keys=_state_keys,
+        ttl=15 * 60,
+        bind_principal=_request_state_principal,
     ),
 )
 
@@ -117,12 +146,10 @@ async def _resolve(environment: str, *, refresh: bool = False) -> tuple[Settings
     return settings, nango, secret
 
 
-def _assert_confirmation(value: str, expected: str) -> None:
+def _assert_writable() -> None:
     settings, _, _ = _runtime()
     if settings.read_only:
         raise ValueError("This Nango MCP server is running in read-only mode")
-    if settings.require_confirmation and value != expected:
-        raise ValueError(f"confirmation must exactly equal: {expected}")
 
 
 def sanitize_response(value: Any) -> Any:
@@ -342,6 +369,155 @@ def _provider_sort_key(provider: dict[str, Any], query: str) -> tuple[int, str]:
     return rank, name or display
 
 
+MUTATION_EFFECTS = {
+    "create_integration": "elevated",
+    "update_integration": "elevated",
+    "delete_integration": "destructive",
+    "refresh_connection_credentials": "elevated",
+    "import_connection": "elevated",
+    "delete_connection": "destructive",
+    "patch_connection_tags": "low",
+    "set_connection_metadata": "low",
+    "create_connect_session": "elevated",
+    "create_standard_connect_session": "elevated",
+    "create_reconnect_session": "elevated",
+    "apply_connection_convention": "low",
+}
+
+
+class MutationApprovalError(PermissionError):
+    pass
+
+
+class LegacyMutationApproval(BaseModel):
+    approve: bool = Field(title="Approve this mutation")
+
+
+def _approval_hash(tool: str, environment: str, args: tuple[Any, ...]) -> str:
+    encoded = json.dumps(
+        {"tool": tool, "environment": environment, "args": args},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _approval_message(tool: str, environment: str, args: tuple[Any, ...]) -> str:
+    target = ""
+    if tool in {"update_integration", "delete_integration"} and args:
+        target = f" integration={args[0]}"
+    elif tool in {
+        "refresh_connection_credentials", "delete_connection", "patch_connection_tags",
+        "set_connection_metadata", "create_reconnect_session", "apply_connection_convention",
+    } and len(args) >= 2:
+        target = f" connection={args[0]} integration={args[1]}"
+    return (
+        f"Approve Nango mutation: effect={MUTATION_EFFECTS[tool]} "
+        f"environment={environment} tool={tool}{target}"
+    )
+
+
+async def _target_snapshot(tool: str, environment: str, args: tuple[Any, ...]) -> str | None:
+    target: Any = None
+    if tool in {"update_integration", "delete_integration"}:
+        _, nango, secret = await _resolve(environment)
+        target = await nango.get_integration(secret.nango_secret_key, str(args[0]))
+    elif tool in {
+        "refresh_connection_credentials", "delete_connection", "patch_connection_tags",
+        "set_connection_metadata", "create_reconnect_session", "apply_connection_convention",
+    }:
+        _, nango, secret = await _resolve(environment)
+        target = await nango.get_connection(secret.nango_secret_key, str(args[0]), str(args[1]))
+    if target is None:
+        return None
+    encoded = json.dumps(sanitize_response(target), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _input_required(
+    tool: str,
+    environment: str,
+    args: tuple[Any, ...],
+    snapshot: str | None,
+) -> InputRequiredResult:
+    state = json.dumps(
+        {
+            "v": 1,
+            "tool": tool,
+            "environment": environment,
+            "effect": MUTATION_EFFECTS[tool],
+            "snapshot": snapshot,
+            "requestHash": _approval_hash(tool, environment, args),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return InputRequiredResult(
+        input_requests={
+            "approve": ElicitRequest(
+                params=ElicitRequestFormParams(
+                    message=_approval_message(tool, environment, args),
+                    requestedSchema={
+                        "type": "object",
+                        "properties": {"approve": {"type": "boolean", "title": "Approve this mutation"}},
+                        "required": ["approve"],
+                        "additionalProperties": False,
+                    },
+                )
+            )
+        },
+        request_state=state,
+    )
+
+
+async def _authorize_mutation(
+    ctx: Context | None,
+    tool: str,
+    environment: str,
+    args: tuple[Any, ...],
+) -> InputRequiredResult | None:
+    if ctx is None:
+        return None
+    _assert_writable()
+    caller = require_scope()
+    if caller.mutation_approval == "host" and MUTATION_EFFECTS[tool] != "destructive":
+        return None
+    snapshot = await _target_snapshot(tool, environment, args)
+    if ctx.protocol_version not in MODERN_PROTOCOL_VERSIONS:
+        session = ctx.request_context.session
+        capabilities = session.client_capabilities
+        if not session.can_send_request or capabilities is None or capabilities.elicitation is None:
+            raise MutationApprovalError("MCP client does not support a secure mutation approval flow")
+        response = await ctx.elicit(_approval_message(tool, environment, args), LegacyMutationApproval)
+        if response.action != "accept" or not response.data.approve:
+            raise MutationApprovalError("Nango mutation was not approved")
+        if await _target_snapshot(tool, environment, args) != snapshot:
+            raise MutationApprovalError("Nango mutation target changed during approval")
+        return None
+    if not ctx.request_state or not ctx.input_responses:
+        return _input_required(tool, environment, args, snapshot)
+    try:
+        state = json.loads(ctx.request_state)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise MutationApprovalError("invalid approval state") from exc
+    expected = {
+        "v": 1,
+        "tool": tool,
+        "environment": environment,
+        "effect": MUTATION_EFFECTS[tool],
+        "requestHash": _approval_hash(tool, environment, args),
+    }
+    if any(state.get(key) != value for key, value in expected.items()):
+        raise MutationApprovalError("approval state does not match this operation")
+    if state.get("snapshot") != snapshot:
+        return _input_required(tool, environment, args, snapshot)
+    response = ctx.input_responses.get("approve")
+    if not isinstance(response, ElicitResult) or response.action != "accept" or response.content != {"approve": True}:
+        raise MutationApprovalError("Nango mutation was not approved")
+    return None
+
+
 @mcp.tool()
 def describe_connection_convention() -> dict[str, Any]:
     """Explain the optional Nango MCP connection convention helpers."""
@@ -460,24 +636,28 @@ async def search_provider_templates(
 
 
 @mcp.tool()
-async def create_integration(environment: str, payload: dict[str, Any], confirmation: str = "") -> Any:
+async def create_integration(ctx: Context, environment: str, payload: dict[str, Any]) -> Any:
     """Create a Nango integration using the Nango API payload shape."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "create_integration", environment, (payload,))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(await nango.create_integration(secret.nango_secret_key, payload))
 
 
 @mcp.tool()
 async def update_integration(
+    ctx: Context,
     environment: str,
     integration_id: str,
     fields: dict[str, Any],
-    confirmation: str = "",
     reconnect_connection_ids: list[str] | None = None,
     auto_reconnect_single_matching_connection: bool = True,
 ) -> Any:
     """Patch a Nango integration."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "update_integration", environment, (integration_id, fields))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     scope_change = _integration_update_contains_scope_change(fields)
     current_integration = None
@@ -542,9 +722,11 @@ async def update_integration(
 
 
 @mcp.tool()
-async def delete_integration(environment: str, integration_id: str, confirmation: str = "") -> Any:
+async def delete_integration(ctx: Context, environment: str, integration_id: str) -> Any:
     """Delete a Nango integration."""
-    _assert_confirmation(confirmation, DELETE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "delete_integration", environment, (integration_id,))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(await nango.delete_integration(secret.nango_secret_key, integration_id))
 
@@ -593,13 +775,17 @@ async def get_connection(
 
 @mcp.tool()
 async def refresh_connection_credentials(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
-    confirmation: str = "",
 ) -> dict[str, Any]:
     """Force an OAuth refresh and return only a non-secret credential summary."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "refresh_connection_credentials", environment, (connection_id, provider_config_key)
+    )
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     response = await nango.get_connection(
         secret.nango_secret_key,
@@ -675,36 +861,44 @@ async def get_connection_context(
 
 
 @mcp.tool()
-async def import_connection(environment: str, payload: dict[str, Any], confirmation: str = "") -> Any:
+async def import_connection(ctx: Context, environment: str, payload: dict[str, Any]) -> Any:
     """Import/create a connection using the Nango API payload shape."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "import_connection", environment, (payload,))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(await nango.import_connection(secret.nango_secret_key, payload))
 
 
 @mcp.tool()
 async def delete_connection(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
-    confirmation: str = "",
 ) -> Any:
     """Delete one Nango connection."""
-    _assert_confirmation(confirmation, DELETE_CONFIRMATION)
+    approval = await _authorize_mutation(ctx, "delete_connection", environment, (connection_id, provider_config_key))
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(await nango.delete_connection(secret.nango_secret_key, connection_id, provider_config_key))
 
 
 @mcp.tool()
 async def patch_connection_tags(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
     tags: dict[str, str],
-    confirmation: str = "",
 ) -> Any:
     """Replace a connection's complete tag set. Fetch and merge first when changing one tag."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "patch_connection_tags", environment, (connection_id, provider_config_key, tags)
+    )
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
         await nango.patch_connection_tags(secret.nango_secret_key, connection_id, provider_config_key, tags)
@@ -713,15 +907,19 @@ async def patch_connection_tags(
 
 @mcp.tool()
 async def set_connection_metadata(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
     metadata: dict[str, Any],
     patch: bool = False,
-    confirmation: str = "",
 ) -> Any:
     """Set or patch connection metadata. Do not put credentials or required connection config here."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "set_connection_metadata", environment, (connection_id, provider_config_key, metadata, patch)
+    )
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
         await nango.set_connection_metadata(
@@ -736,14 +934,18 @@ async def set_connection_metadata(
 
 @mcp.tool()
 async def create_connect_session(
+    ctx: Context,
     environment: str,
     allowed_integrations: list[str],
     tags: dict[str, str] | None = None,
     integrations_config_defaults: dict[str, Any] | None = None,
-    confirmation: str = "",
 ) -> Any:
     """Create a Nango Connect session token."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "create_connect_session", environment, (allowed_integrations, tags, integrations_config_defaults)
+    )
+    if approval:
+        return approval
     payload: dict[str, Any] = {"allowed_integrations": allowed_integrations}
     if tags:
         payload["tags"] = tags
@@ -756,6 +958,7 @@ async def create_connect_session(
 
 @mcp.tool()
 async def create_standard_connect_session(
+    ctx: Context,
     environment: str,
     provider_config_key: str,
     principal: str,
@@ -766,10 +969,13 @@ async def create_standard_connect_session(
     email: str | None = None,
     integrations_config_defaults: dict[str, Any] | None = None,
     oauth_app_owner: str | None = None,
-    confirmation: str = "",
 ) -> Any:
     """Create a Connect session and return its post-auth finalization contract."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "create_standard_connect_session", environment, (provider_config_key, principal)
+    )
+    if approval:
+        return approval
     tags = convention_tags(
         environment,
         principal,
@@ -811,13 +1017,17 @@ async def create_standard_connect_session(
 
 @mcp.tool()
 async def create_reconnect_session(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
-    confirmation: str = "",
 ) -> Any:
     """Create a Nango reconnect session for an existing connection."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "create_reconnect_session", environment, (connection_id, provider_config_key)
+    )
+    if approval:
+        return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
         await nango.create_reconnect_session(
@@ -883,6 +1093,7 @@ def build_connection_convention(
 
 @mcp.tool()
 async def apply_connection_convention(
+    ctx: Context,
     environment: str,
     connection_id: str,
     provider_config_key: str,
@@ -893,10 +1104,13 @@ async def apply_connection_convention(
     patch_metadata: bool = True,
     display_name: str | None = None,
     email: str | None = None,
-    confirmation: str = "",
 ) -> dict[str, Any]:
     """Apply suggested Nango MCP tags and metadata to an existing connection."""
-    _assert_confirmation(confirmation, WRITE_CONFIRMATION)
+    approval = await _authorize_mutation(
+        ctx, "apply_connection_convention", environment, (connection_id, provider_config_key, principal)
+    )
+    if approval:
+        return approval
     settings, nango, secret = await _resolve(environment)
     tags = convention_tags(secret.environment, principal, owner_kind, purpose)
     metadata = convention_metadata(

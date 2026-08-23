@@ -53,7 +53,6 @@ class Settings:
     metadata_namespace: str = DEFAULT_METADATA_NAMESPACE
     request_timeout: float = 20.0
     read_only: bool = False
-    require_confirmation: bool = False
     infisical: InfisicalSettings | None = None
     transport: str = "stdio"
     http_host: str = "127.0.0.1"
@@ -261,6 +260,8 @@ def load_settings() -> Settings:
         raise RuntimeError(
             "NANGO_MCP_TOKENS or NANGO_MCP_TOKEN_REGISTRY_FILE is required for static HTTP auth"
         )
+    if transport == "http" and not request_state_keys:
+        raise RuntimeError("NANGO_MCP_REQUEST_STATE_KEYS is required for HTTP transport")
 
     return Settings(
         nango_url=_value(file_values, "NANGO_BASE_URL", "NANGO_MCP_NANGO_URL", default=DEFAULT_NANGO_URL).rstrip("/"),
@@ -276,7 +277,6 @@ def load_settings() -> Settings:
         ),
         request_timeout=_timeout(file_values),
         read_only=_bool(file_values, "NANGO_MCP_READ_ONLY"),
-        require_confirmation=_bool(file_values, "NANGO_MCP_REQUIRE_CONFIRMATION"),
         infisical=_load_infisical(file_values, secret_resolver),
         transport=transport,
         http_host=_value(file_values, "NANGO_MCP_HTTP_HOST", default="127.0.0.1"),
