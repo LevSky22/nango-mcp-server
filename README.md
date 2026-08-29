@@ -191,7 +191,7 @@ Override storage with `NANGO_MCP_ARTIFACT_ROOT`, `NANGO_MCP_ARTIFACT_MAX_BYTES`,
 
 ## Proxy v1 contract
 
-The proxy, artifact-query, and download tools use strict camelCase wire names. Unknown arguments are rejected.
+Every tool uses strict camelCase wire names. Unknown arguments and legacy snake_case spellings are rejected.
 
 `proxy_request` accepts:
 
@@ -224,7 +224,7 @@ The server exposes 26 tools, grouped by workflow:
 | Provider discovery | `search_provider_templates`, `download_provider_file` | Read |
 | Integrations | `list_integrations`, `get_integration`, `create_integration`, `update_integration`, `delete_integration` | Read/write |
 | Connections | `list_connections`, `get_connection`, `get_connection_context`, `refresh_connection_credentials`, `import_connection`, `delete_connection` | Read/write |
-| Tags and metadata | `patch_connection_tags`, `set_connection_metadata` | Write |
+| Tags and metadata | `replace_connection_tags`, `update_connection_metadata` | Write |
 | Connect sessions | `create_connect_session`, `create_standard_connect_session`, `create_reconnect_session` | Write |
 | Provider API and large responses | `proxy_request`, `query_response_artifact` | Read/write |
 | Optional connection conventions | `describe_connection_convention`, `build_connection_convention`, `apply_connection_convention`, `audit_connection_conventions` | Read/write |

@@ -6,6 +6,41 @@ from nango_mcp import server
 
 
 @pytest.mark.asyncio
+async def test_list_connections_uses_documented_nango_filters(monkeypatch) -> None:
+    class FakeNango:
+        def __init__(self) -> None:
+            self.filters = None
+
+        async def list_connections(self, _secret, filters):
+            self.filters = filters
+            return {"connections": []}
+
+    fake = FakeNango()
+
+    async def fake_resolve(_environment):
+        return None, fake, SimpleNamespace(nango_secret_key="fake-secret")
+
+    monkeypatch.setattr(server, "_resolve", fake_resolve)
+    await server.list_connections(
+        "sandbox",
+        connectionId="sample-connection",
+        integrationId="sample-integration",
+        search="person@example.test",
+        endUserId="person-123",
+        endUserOrganizationId="organization-123",
+        limit=25,
+    )
+    assert fake.filters == {
+        "connectionId": "sample-connection",
+        "integrationId": "sample-integration",
+        "search": "person@example.test",
+        "endUserId": "person-123",
+        "endUserOrganizationId": "organization-123",
+        "limit": 25,
+    }
+
+
+@pytest.mark.asyncio
 async def test_standard_connect_session_returns_generic_finalization(monkeypatch) -> None:
     class FakeNango:
         async def create_connect_session(self, _secret, payload):
@@ -25,9 +60,9 @@ async def test_standard_connect_session_returns_generic_finalization(monkeypatch
         "person@example.test",
         "user",
         "messaging",
-        display_name="Example Person",
+        displayName="Example Person",
         email="person@example.test",
-        oauth_app_owner="customer",
+        oauthAppOwner="customer",
     )
 
     finalization = result["post_auth_finalization"]
@@ -50,11 +85,11 @@ async def test_apply_convention_projects_identity_without_patching_end_user(monk
                 },
             }
 
-        async def patch_connection_tags(self, *_args):
+        async def replace_connection_tags(self, *_args):
             self.tags = _args[-1]
             return {"success": True}
 
-        async def set_connection_metadata(self, *_args, **_kwargs):
+        async def update_connection_metadata(self, *_args, **_kwargs):
             return {"success": True}
 
     fake = FakeNango()
@@ -75,14 +110,12 @@ async def test_apply_convention_projects_identity_without_patching_end_user(monk
         "person@example.test",
         "user",
         "messaging",
-        display_name="Updated Name",
-        email="updated@example.test",
     )
 
     assert fake.tags["existing"] == "keep"
-    assert fake.tags["end_user_display_name"] == "Updated Name"
-    assert fake.tags["end_user_email"] == "updated@example.test"
-    assert result["identity_projection"]["display_name"] == "Updated Name"
+    assert fake.tags["end_user_display_name"] == "Existing Name"
+    assert fake.tags["end_user_email"] == "existing@example.test"
+    assert result["identity_projection"]["display_name"] == "Existing Name"
 
 
 @pytest.mark.asyncio

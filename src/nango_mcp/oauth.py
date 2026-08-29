@@ -77,7 +77,7 @@ def caller_scope_from_access_token(access_token: AccessToken) -> CallerScope:
         denied_tools.update({
             "create_integration", "update_integration", "delete_integration",
             "refresh_connection_credentials", "import_connection", "delete_connection",
-            "patch_connection_tags", "set_connection_metadata", "create_connect_session",
+            "replace_connection_tags", "update_connection_metadata", "create_connect_session",
             "create_standard_connect_session", "create_reconnect_session",
             "apply_connection_convention",
         })

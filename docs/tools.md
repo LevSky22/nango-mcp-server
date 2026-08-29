@@ -24,7 +24,7 @@ All tools that accept `environment` enforce the authenticated caller's environme
 
 ### `search_provider_templates`
 
-**Read.** Searches Nango's provider catalog before an integration is created. Important inputs are `environment`, `query`, `limit`, and `include_raw_templates`; results include compact matches and any related configured integrations.
+**Read.** Searches Nango's provider catalog before an integration is created. Important inputs are `environment`, `query`, `limit`, and `includeRawTemplates`; results include compact matches and any related configured integrations.
 
 ### `download_provider_file`
 
@@ -34,11 +34,11 @@ All tools that accept `environment` enforce the authenticated caller's environme
 
 ### `list_integrations`
 
-**Read.** Lists integrations in one environment. `refresh_secret` can request fresh environment-secret resolution.
+**Read.** Lists integrations in one environment. `refreshSecret` can request fresh environment-secret resolution.
 
 ### `get_integration`
 
-**Read.** Gets one integration by `integration_id`. Credential-like fields remain redacted even when `include_credentials` asks Nango for credential configuration.
+**Read.** Gets one integration by `integrationId`. Credential-like fields remain redacted even when `includeCredentials` asks Nango for credential configuration.
 
 ### `create_integration`
 
@@ -50,17 +50,17 @@ All tools that accept `environment` enforce the authenticated caller's environme
 
 ### `delete_integration`
 
-**Write, destructive.** Deletes an integration by `integration_id`. Destructive actions always require server-bound approval.
+**Write, destructive.** Deletes an integration by `integrationId`. Destructive actions always require server-bound approval.
 
 ## Connections
 
 ### `list_connections`
 
-**Read.** Lists connections with optional connection ID, text search, tag, and limit filters. Prefer stable Nango tags such as `end_user_id` or `organization_id` for attribution and filtering.
+**Read.** Lists connections with optional `connectionId`, `integrationId`, text search, native `endUserId`, `endUserOrganizationId`, and limit filters.
 
 ### `get_connection`
 
-**Read.** Gets a connection using `connection_id` and `provider_config_key`. Credential-like response fields are always redacted.
+**Read.** Gets a connection using `connectionId` and `providerConfigKey`. Credential-like response fields are always redacted.
 
 ### `get_connection_context`
 
@@ -76,17 +76,17 @@ All tools that accept `environment` enforce the authenticated caller's environme
 
 ### `delete_connection`
 
-**Write, destructive.** Deletes a connection identified by `connection_id` and `provider_config_key`. Destructive actions always require server-bound approval.
+**Write, destructive.** Deletes a connection identified by `connectionId` and `providerConfigKey`. Destructive actions always require server-bound approval.
 
 ## Tags and metadata
 
-### `patch_connection_tags`
+### `replace_connection_tags`
 
 **Write.** Replaces the connection's complete tag object. Fetch and merge the existing tags first when changing only selected keys.
 
-### `set_connection_metadata`
+### `update_connection_metadata`
 
-**Write.** Sets or patches connection metadata depending on `patch`. Metadata is for application configuration, not credentials or large synchronized datasets.
+**Write.** Merges or replaces connection metadata according to `mode`, which defaults to `merge`. Metadata is for application configuration, not credentials or large synchronized datasets.
 
 ## Connect sessions
 
@@ -100,7 +100,7 @@ All tools that accept `environment` enforce the authenticated caller's environme
 
 ### `create_reconnect_session`
 
-**Write.** Creates a reconnect session for an existing `connection_id` and `provider_config_key`.
+**Write.** Creates a reconnect session for an existing `connectionId` and `providerConfigKey`.
 
 ## Provider API and large responses
 

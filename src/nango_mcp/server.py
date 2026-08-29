@@ -418,8 +418,8 @@ MUTATION_EFFECTS = {
     "refresh_connection_credentials": "elevated",
     "import_connection": "elevated",
     "delete_connection": "destructive",
-    "patch_connection_tags": "low",
-    "set_connection_metadata": "low",
+    "replace_connection_tags": "low",
+    "update_connection_metadata": "low",
     "create_connect_session": "elevated",
     "create_standard_connect_session": "elevated",
     "create_reconnect_session": "elevated",
@@ -456,8 +456,8 @@ def _approval_message(tool: str, environment: str, args: tuple[Any, ...]) -> str
     if tool in {"update_integration", "delete_integration"} and args:
         target = f" integration={args[0]}"
     elif tool in {
-        "refresh_connection_credentials", "delete_connection", "patch_connection_tags",
-        "set_connection_metadata", "create_reconnect_session", "apply_connection_convention",
+        "refresh_connection_credentials", "delete_connection", "replace_connection_tags",
+        "update_connection_metadata", "create_reconnect_session", "apply_connection_convention",
     } and len(args) >= 2:
         target = f" connection={args[0]} integration={args[1]}"
     elif tool == "proxy_request" and len(args) >= 4:
@@ -474,8 +474,8 @@ async def _target_snapshot(tool: str, environment: str, args: tuple[Any, ...]) -
         _, nango, secret = await _resolve(environment)
         target = await nango.get_integration(secret.nango_secret_key, str(args[0]))
     elif tool in {
-        "refresh_connection_credentials", "delete_connection", "patch_connection_tags",
-        "set_connection_metadata", "create_reconnect_session", "apply_connection_convention",
+        "refresh_connection_credentials", "delete_connection", "replace_connection_tags",
+        "update_connection_metadata", "create_reconnect_session", "apply_connection_convention",
     }:
         _, nango, secret = await _resolve(environment)
         target = await nango.get_connection(secret.nango_secret_key, str(args[0]), str(args[1]))
@@ -629,18 +629,18 @@ async def check_environment(environment: str, refresh: bool = False) -> dict[str
 
 
 @mcp.tool()
-async def list_integrations(environment: str, refresh_secret: bool = False) -> Any:
+async def list_integrations(environment: str, refreshSecret: bool = False) -> Any:
     """List integrations configured in one Nango environment."""
-    _, nango, secret = await _resolve(environment, refresh=refresh_secret)
+    _, nango, secret = await _resolve(environment, refresh=refreshSecret)
     return sanitize_response(await nango.list_integrations(secret.nango_secret_key))
 
 
 @mcp.tool()
-async def get_integration(environment: str, integration_id: str, include_credentials: bool = False) -> Any:
+async def get_integration(environment: str, integrationId: str, includeCredentials: bool = False) -> Any:
     """Get one Nango integration. Credential-like response fields are redacted."""
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
-        await nango.get_integration(secret.nango_secret_key, integration_id, include_credentials=include_credentials)
+        await nango.get_integration(secret.nango_secret_key, integrationId, include_credentials=includeCredentials)
     )
 
 
@@ -649,7 +649,7 @@ async def search_provider_templates(
     environment: str,
     query: str,
     limit: int = 10,
-    include_raw_templates: bool = False,
+    includeRawTemplates: bool = False,
 ) -> dict[str, Any]:
     """Search Nango provider templates before creating an integration."""
     _, nango, secret = await _resolve(environment)
@@ -686,7 +686,7 @@ async def search_provider_templates(
             "connection": "An authorized account/workspace/mailbox under one integration.",
         },
         "matches": provider_summaries,
-        "raw_templates": sanitize_response(selected_providers) if include_raw_templates else None,
+        "raw_templates": sanitize_response(selected_providers) if includeRawTemplates else None,
         "existing_integrations": existing_integrations,
         "secret_material_returned": False,
     }
@@ -706,13 +706,13 @@ async def create_integration(ctx: Context, environment: str, payload: dict[str, 
 async def update_integration(
     ctx: Context,
     environment: str,
-    integration_id: str,
+    integrationId: str,
     fields: dict[str, Any],
-    reconnect_connection_ids: list[str] | None = None,
-    auto_reconnect_single_matching_connection: bool = True,
+    reconnectConnectionIds: list[str] | None = None,
+    autoReconnectSingleMatchingConnection: bool = True,
 ) -> Any:
     """Patch a Nango integration."""
-    approval = await _authorize_mutation(ctx, "update_integration", environment, (integration_id, fields))
+    approval = await _authorize_mutation(ctx, "update_integration", environment, (integrationId, fields))
     if approval:
         return approval
     _, nango, secret = await _resolve(environment)
@@ -721,37 +721,37 @@ async def update_integration(
     if scope_change:
         current_integration = await nango.get_integration(
             secret.nango_secret_key,
-            integration_id,
+            integrationId,
             include_credentials=True,
         )
     prepared_fields, operator_notes = _prepare_integration_update_fields(fields, current_integration)
-    response = sanitize_response(await nango.update_integration(secret.nango_secret_key, integration_id, prepared_fields))
-    if scope_change and not reconnect_connection_ids and auto_reconnect_single_matching_connection:
+    response = sanitize_response(await nango.update_integration(secret.nango_secret_key, integrationId, prepared_fields))
+    if scope_change and not reconnectConnectionIds and autoReconnectSingleMatchingConnection:
         connections_payload = await nango.list_connections(secret.nango_secret_key)
         matching_connections = [
             connection for connection in _as_data_list(connections_payload)
-            if _connection_matches_integration(connection, integration_id)
+            if _connection_matches_integration(connection, integrationId)
         ]
         if len(matching_connections) == 1:
-            reconnect_connection_ids = [
+            reconnectConnectionIds = [
                 matching_connections[0].get("connection_id")
                 or matching_connections[0].get("connectionId")
                 or ""
             ]
-            reconnect_connection_ids = [connection_id for connection_id in reconnect_connection_ids if connection_id]
+            reconnectConnectionIds = [connection_id for connection_id in reconnectConnectionIds if connection_id]
         elif len(matching_connections) > 1:
             operator_notes.append(
-                f"Found {len(matching_connections)} connections for integration {integration_id}; "
-                "no reconnect sessions were created automatically. Pass reconnect_connection_ids for the affected accounts."
+                f"Found {len(matching_connections)} connections for integration {integrationId}; "
+                "no reconnect sessions were created automatically. Pass reconnectConnectionIds for the affected accounts."
             )
         else:
             operator_notes.append(
-                f"No existing connections were found for integration {integration_id}; no reconnect session was created."
+                f"No existing connections were found for integration {integrationId}; no reconnect session was created."
             )
 
     reconnect_sessions: list[dict[str, Any]] = []
-    if scope_change and reconnect_connection_ids:
-        for connection_id in reconnect_connection_ids:
+    if scope_change and reconnectConnectionIds:
+        for connection_id in reconnectConnectionIds:
             reconnect_sessions.append(
                 {
                     "connection_id": connection_id,
@@ -759,7 +759,7 @@ async def update_integration(
                         await nango.create_reconnect_session(
                             secret.nango_secret_key,
                             connection_id=connection_id,
-                            integration_id=integration_id,
+                            integration_id=integrationId,
                         )
                     ),
                 }
@@ -767,7 +767,7 @@ async def update_integration(
         operator_notes.append("Created reconnect session(s) for supplied or inferred affected connection id(s).")
     elif scope_change:
         operator_notes.append(
-            "No reconnect session was created. Pass reconnect_connection_ids when you want the MCP to create "
+            "No reconnect session was created. Pass reconnectConnectionIds when you want the MCP to create "
             "reconnect sessions after the scope patch."
         )
 
@@ -779,31 +779,37 @@ async def update_integration(
 
 
 @mcp.tool()
-async def delete_integration(ctx: Context, environment: str, integration_id: str) -> Any:
+async def delete_integration(ctx: Context, environment: str, integrationId: str) -> Any:
     """Delete a Nango integration."""
-    approval = await _authorize_mutation(ctx, "delete_integration", environment, (integration_id,))
+    approval = await _authorize_mutation(ctx, "delete_integration", environment, (integrationId,))
     if approval:
         return approval
     _, nango, secret = await _resolve(environment)
-    return sanitize_response(await nango.delete_integration(secret.nango_secret_key, integration_id))
+    return sanitize_response(await nango.delete_integration(secret.nango_secret_key, integrationId))
 
 
 @mcp.tool()
 async def list_connections(
     environment: str,
-    connection_id: str | None = None,
+    connectionId: str | None = None,
+    integrationId: str | None = None,
     search: str | None = None,
-    tags: dict[str, str] | None = None,
+    endUserId: str | None = None,
+    endUserOrganizationId: str | None = None,
     limit: int | None = None,
 ) -> Any:
-    """List Nango connections. Prefer tag filters such as end_user_id and organization_id."""
+    """List Nango connections using Nango's documented query filters."""
     filters: dict[str, Any] = {}
-    if connection_id:
-        filters["connectionId"] = connection_id
+    if connectionId:
+        filters["connectionId"] = connectionId
+    if integrationId:
+        filters["integrationId"] = integrationId
     if search:
         filters["search"] = search
-    for key, value in (tags or {}).items():
-        filters[f"tags[{key}]"] = value
+    if endUserId:
+        filters["endUserId"] = endUserId
+    if endUserOrganizationId:
+        filters["endUserOrganizationId"] = endUserOrganizationId
     if limit:
         filters["limit"] = limit
 
@@ -814,18 +820,18 @@ async def list_connections(
 @mcp.tool()
 async def get_connection(
     environment: str,
-    connection_id: str,
-    provider_config_key: str,
-    include_credentials: bool = False,
+    connectionId: str,
+    providerConfigKey: str,
+    includeCredentials: bool = False,
 ) -> Any:
     """Get a Nango connection. Credential-like response fields are redacted."""
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
         await nango.get_connection(
             secret.nango_secret_key,
-            connection_id,
-            provider_config_key,
-            include_credentials=include_credentials,
+            connectionId,
+            providerConfigKey,
+            include_credentials=includeCredentials,
         )
     )
 
@@ -834,20 +840,20 @@ async def get_connection(
 async def refresh_connection_credentials(
     ctx: Context,
     environment: str,
-    connection_id: str,
-    provider_config_key: str,
+    connectionId: str,
+    providerConfigKey: str,
 ) -> dict[str, Any]:
     """Force an OAuth refresh and return only a non-secret credential summary."""
     approval = await _authorize_mutation(
-        ctx, "refresh_connection_credentials", environment, (connection_id, provider_config_key)
+        ctx, "refresh_connection_credentials", environment, (connectionId, providerConfigKey)
     )
     if approval:
         return approval
     _, nango, secret = await _resolve(environment)
     response = await nango.get_connection(
         secret.nango_secret_key,
-        connection_id,
-        provider_config_key,
+        connectionId,
+        providerConfigKey,
         include_credentials=True,
         force_refresh=True,
     )
@@ -858,8 +864,8 @@ async def refresh_connection_credentials(
     if not isinstance(raw_credentials, dict):
         raw_credentials = {}
     return {
-        "connection_id": connection_id,
-        "provider_config_key": provider_config_key,
+        "connection_id": connectionId,
+        "provider_config_key": providerConfigKey,
         "refreshed": True,
         "credential_summary": {
             "has_access_token": bool(credentials.get("access_token")),
@@ -874,16 +880,16 @@ async def refresh_connection_credentials(
 @mcp.tool()
 async def get_connection_context(
     environment: str,
-    connection_id: str,
-    provider_config_key: str,
-    include_raw_provider_template: bool = False,
+    connectionId: str,
+    providerConfigKey: str,
+    includeRawProviderTemplate: bool = False,
 ) -> dict[str, Any]:
     """Return a compact, redacted context view for one connection."""
     _, nango, secret = await _resolve(environment)
     connection = sanitize_response(
-        await nango.get_connection(secret.nango_secret_key, connection_id, provider_config_key)
+        await nango.get_connection(secret.nango_secret_key, connectionId, providerConfigKey)
     )
-    integration = sanitize_response(await nango.get_integration(secret.nango_secret_key, provider_config_key))
+    integration = sanitize_response(await nango.get_integration(secret.nango_secret_key, providerConfigKey))
     providers_payload = await nango.list_providers(secret.nango_secret_key)
 
     connection_body = connection if isinstance(connection, dict) else {}
@@ -898,13 +904,13 @@ async def get_connection_context(
 
     return {
         "environment": secret.environment,
-        "connection_id": connection_body.get("connection_id") or connection_body.get("connectionId") or connection_id,
+        "connection_id": connection_body.get("connection_id") or connection_body.get("connectionId") or connectionId,
         "provider_config_key": connection_body.get("provider_config_key")
         or connection_body.get("providerConfigKey")
-        or provider_config_key,
+        or providerConfigKey,
         "provider": provider_name,
         "provider_template": _provider_summary(provider_template) if provider_template else None,
-        "raw_provider_template": sanitize_response(provider_template) if include_raw_provider_template else None,
+        "raw_provider_template": sanitize_response(provider_template) if includeRawProviderTemplate else None,
         "end_user": end_user,
         "organization": organization,
         "tags": connection_body.get("tags") or {},
@@ -931,60 +937,60 @@ async def import_connection(ctx: Context, environment: str, payload: dict[str, A
 async def delete_connection(
     ctx: Context,
     environment: str,
-    connection_id: str,
-    provider_config_key: str,
+    connectionId: str,
+    providerConfigKey: str,
 ) -> Any:
     """Delete one Nango connection."""
-    approval = await _authorize_mutation(ctx, "delete_connection", environment, (connection_id, provider_config_key))
+    approval = await _authorize_mutation(ctx, "delete_connection", environment, (connectionId, providerConfigKey))
     if approval:
         return approval
     _, nango, secret = await _resolve(environment)
-    return sanitize_response(await nango.delete_connection(secret.nango_secret_key, connection_id, provider_config_key))
+    return sanitize_response(await nango.delete_connection(secret.nango_secret_key, connectionId, providerConfigKey))
 
 
 @mcp.tool()
-async def patch_connection_tags(
+async def replace_connection_tags(
     ctx: Context,
     environment: str,
-    connection_id: str,
-    provider_config_key: str,
+    connectionId: str,
+    providerConfigKey: str,
     tags: dict[str, str],
 ) -> Any:
     """Replace a connection's complete tag set. Fetch and merge first when changing one tag."""
     approval = await _authorize_mutation(
-        ctx, "patch_connection_tags", environment, (connection_id, provider_config_key, tags)
+        ctx, "replace_connection_tags", environment, (connectionId, providerConfigKey, tags)
     )
     if approval:
         return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
-        await nango.patch_connection_tags(secret.nango_secret_key, connection_id, provider_config_key, tags)
+        await nango.replace_connection_tags(secret.nango_secret_key, connectionId, providerConfigKey, tags)
     )
 
 
 @mcp.tool()
-async def set_connection_metadata(
+async def update_connection_metadata(
     ctx: Context,
     environment: str,
-    connection_id: str,
-    provider_config_key: str,
+    connectionId: str,
+    providerConfigKey: str,
     metadata: dict[str, Any],
-    patch: bool = False,
+    mode: Literal["merge", "replace"] = "merge",
 ) -> Any:
-    """Set or patch connection metadata. Do not put credentials or required connection config here."""
+    """Merge or replace structured connection metadata. Do not store credentials here."""
     approval = await _authorize_mutation(
-        ctx, "set_connection_metadata", environment, (connection_id, provider_config_key, metadata, patch)
+        ctx, "update_connection_metadata", environment, (connectionId, providerConfigKey, metadata, mode)
     )
     if approval:
         return approval
     _, nango, secret = await _resolve(environment)
     return sanitize_response(
-        await nango.set_connection_metadata(
+        await nango.update_connection_metadata(
             secret.nango_secret_key,
-            connection_id,
-            provider_config_key,
+            connectionId,
+            providerConfigKey,
             metadata,
-            patch=patch,
+            mode=mode,
         )
     )
 
@@ -993,21 +999,21 @@ async def set_connection_metadata(
 async def create_connect_session(
     ctx: Context,
     environment: str,
-    allowed_integrations: list[str],
+    allowedIntegrations: list[str],
     tags: dict[str, str] | None = None,
-    integrations_config_defaults: dict[str, Any] | None = None,
+    integrationsConfigDefaults: dict[str, Any] | None = None,
 ) -> Any:
     """Create a Nango Connect session token."""
     approval = await _authorize_mutation(
-        ctx, "create_connect_session", environment, (allowed_integrations, tags, integrations_config_defaults)
+        ctx, "create_connect_session", environment, (allowedIntegrations, tags, integrationsConfigDefaults)
     )
     if approval:
         return approval
-    payload: dict[str, Any] = {"allowed_integrations": allowed_integrations}
+    payload: dict[str, Any] = {"allowed_integrations": allowedIntegrations}
     if tags:
         payload["tags"] = tags
-    if integrations_config_defaults:
-        payload["integrations_config_defaults"] = integrations_config_defaults
+    if integrationsConfigDefaults:
+        payload["integrations_config_defaults"] = integrationsConfigDefaults
 
     _, nango, secret = await _resolve(environment)
     return sanitize_response(await nango.create_connect_session(secret.nango_secret_key, payload))
@@ -1017,34 +1023,34 @@ async def create_connect_session(
 async def create_standard_connect_session(
     ctx: Context,
     environment: str,
-    provider_config_key: str,
+    providerConfigKey: str,
     principal: str,
-    owner_kind: str,
+    ownerKind: str,
     purpose: str,
-    organization_id: str | None = None,
-    display_name: str | None = None,
+    organizationId: str | None = None,
+    displayName: str | None = None,
     email: str | None = None,
-    integrations_config_defaults: dict[str, Any] | None = None,
-    oauth_app_owner: str | None = None,
+    integrationsConfigDefaults: dict[str, Any] | None = None,
+    oauthAppOwner: str | None = None,
 ) -> Any:
     """Create a Connect session and return its post-auth finalization contract."""
     approval = await _authorize_mutation(
-        ctx, "create_standard_connect_session", environment, (provider_config_key, principal)
+        ctx, "create_standard_connect_session", environment, (providerConfigKey, principal)
     )
     if approval:
         return approval
     tags = convention_tags(
         environment,
         principal,
-        owner_kind,
+        ownerKind,
         purpose,
         email=email,
-        organization_id=organization_id,
-        display_name=display_name,
+        organization_id=organizationId,
+        display_name=displayName,
     )
-    payload: dict[str, Any] = {"allowed_integrations": [provider_config_key], "tags": tags}
-    if integrations_config_defaults:
-        payload["integrations_config_defaults"] = integrations_config_defaults
+    payload: dict[str, Any] = {"allowed_integrations": [providerConfigKey], "tags": tags}
+    if integrationsConfigDefaults:
+        payload["integrations_config_defaults"] = integrationsConfigDefaults
 
     _, nango, secret = await _resolve(environment)
     response = sanitize_response(await nango.create_connect_session(secret.nango_secret_key, payload))
@@ -1052,20 +1058,20 @@ async def create_standard_connect_session(
     return {
         "tags": tags,
         "post_auth_finalization": {
-            "provider_config_key": provider_config_key,
+            "provider_config_key": providerConfigKey,
             "principal": principal.strip(),
-            "owner_kind": owner_kind,
+            "owner_kind": ownerKind,
             "purpose": purpose,
-            "oauth_app_owner": oauth_app_owner,
-            "display_name": display_name.strip() if display_name else principal.strip(),
+            "oauth_app_owner": oauthAppOwner,
+            "display_name": displayName.strip() if displayName else principal.strip(),
             "email": email.strip() if email else None,
             "metadata": convention_metadata(
                 environment,
                 principal,
-                owner_kind,
+                ownerKind,
                 purpose,
                 namespace=settings.metadata_namespace,
-                oauth_app_owner=oauth_app_owner,
+                oauth_app_owner=oauthAppOwner,
             ),
         },
         "response": response,
@@ -1076,12 +1082,12 @@ async def create_standard_connect_session(
 async def create_reconnect_session(
     ctx: Context,
     environment: str,
-    connection_id: str,
-    provider_config_key: str,
+    connectionId: str,
+    providerConfigKey: str,
 ) -> Any:
     """Create a Nango reconnect session for an existing connection."""
     approval = await _authorize_mutation(
-        ctx, "create_reconnect_session", environment, (connection_id, provider_config_key)
+        ctx, "create_reconnect_session", environment, (connectionId, providerConfigKey)
     )
     if approval:
         return approval
@@ -1089,8 +1095,8 @@ async def create_reconnect_session(
     return sanitize_response(
         await nango.create_reconnect_session(
             secret.nango_secret_key,
-            connection_id=connection_id,
-            integration_id=provider_config_key,
+            connection_id=connectionId,
+            integration_id=providerConfigKey,
         )
     )
 
@@ -1387,24 +1393,24 @@ def read_provider_download(resourceId: str) -> bytes:
 @mcp.tool()
 def build_connection_convention(
     environment: str,
-    provider_config_key: str,
+    providerConfigKey: str,
     principal: str,
-    owner_kind: str,
+    ownerKind: str,
     purpose: str,
-    oauth_app_owner: str | None = None,
+    oauthAppOwner: str | None = None,
 ) -> dict[str, Any]:
     """Build a suggested connection_id, tags, and metadata object for a managed connection."""
     settings, _, _ = _runtime()
     return {
-        "connection_id": imported_connection_id(environment, provider_config_key, principal),
-        "tags": convention_tags(environment, principal, owner_kind, purpose),
+        "connection_id": imported_connection_id(environment, providerConfigKey, principal),
+        "tags": convention_tags(environment, principal, ownerKind, purpose),
         "metadata": convention_metadata(
             environment,
             principal,
-            owner_kind,
+            ownerKind,
             purpose,
             namespace=settings.metadata_namespace,
-            oauth_app_owner=oauth_app_owner,
+            oauth_app_owner=oauthAppOwner,
         ),
     }
 
@@ -1413,56 +1419,54 @@ def build_connection_convention(
 async def apply_connection_convention(
     ctx: Context,
     environment: str,
-    connection_id: str,
-    provider_config_key: str,
+    connectionId: str,
+    providerConfigKey: str,
     principal: str,
-    owner_kind: str,
+    ownerKind: str,
     purpose: str,
-    oauth_app_owner: str | None = None,
-    patch_metadata: bool = True,
-    display_name: str | None = None,
-    email: str | None = None,
+    oauthAppOwner: str | None = None,
+    patchMetadata: bool = True,
 ) -> dict[str, Any]:
-    """Apply suggested Nango MCP tags and metadata to an existing connection."""
+    """Apply suggested tags and metadata, deriving display identity from native end_user."""
     approval = await _authorize_mutation(
-        ctx, "apply_connection_convention", environment, (connection_id, provider_config_key, principal)
+        ctx, "apply_connection_convention", environment, (connectionId, providerConfigKey, principal)
     )
     if approval:
         return approval
     settings, nango, secret = await _resolve(environment)
-    tags = convention_tags(secret.environment, principal, owner_kind, purpose)
+    tags = convention_tags(secret.environment, principal, ownerKind, purpose)
     metadata = convention_metadata(
         secret.environment,
         principal,
-        owner_kind,
+        ownerKind,
         purpose,
         namespace=settings.metadata_namespace,
-        oauth_app_owner=oauth_app_owner,
+        oauth_app_owner=oauthAppOwner,
     )
-    existing = await nango.get_connection(secret.nango_secret_key, connection_id, provider_config_key)
+    existing = await nango.get_connection(secret.nango_secret_key, connectionId, providerConfigKey)
     existing_tags = existing.get("tags") if isinstance(existing, dict) else None
     merged_tags = {**(existing_tags or {}), **tags}
     existing_end_user = existing.get("end_user") if isinstance(existing, dict) else None
     if not isinstance(existing_end_user, dict):
         existing_end_user = {}
-    projected_display_name = display_name.strip() if display_name else existing_end_user.get("display_name")
-    projected_email = email.strip() if email else existing_end_user.get("email")
+    projected_display_name = existing_end_user.get("display_name")
+    projected_email = existing_end_user.get("email")
     if projected_display_name:
         merged_tags["end_user_display_name"] = projected_display_name
     if projected_email:
         merged_tags["end_user_email"] = projected_email
-    tag_response = await nango.patch_connection_tags(
+    tag_response = await nango.replace_connection_tags(
         secret.nango_secret_key,
-        connection_id,
-        provider_config_key,
+        connectionId,
+        providerConfigKey,
         merged_tags,
     )
-    metadata_response = await nango.set_connection_metadata(
+    metadata_response = await nango.update_connection_metadata(
         secret.nango_secret_key,
-        connection_id,
-        provider_config_key,
+        connectionId,
+        providerConfigKey,
         metadata,
-        patch=patch_metadata,
+        mode="merge" if patchMetadata else "replace",
     )
     return {
         "tags": merged_tags,
@@ -1512,6 +1516,18 @@ async def audit_connection_conventions(environment: str, limit: int = 100) -> di
     }
 
 
+def _drop_null_schema_defaults(value: Any) -> None:
+    """Keep optional inputs optional without advertising JSON null as their default."""
+    if isinstance(value, dict):
+        if value.get("default", object()) is None:
+            value.pop("default")
+        for child in value.values():
+            _drop_null_schema_defaults(child)
+    elif isinstance(value, list):
+        for child in value:
+            _drop_null_schema_defaults(child)
+
+
 def _enforce_strict_tool_arguments(*names: str) -> None:
     for name in names:
         tool = mcp._tool_manager.get_tool(name)  # type: ignore[attr-defined]
@@ -1521,12 +1537,25 @@ def _enforce_strict_tool_arguments(*names: str) -> None:
         argument_model.model_config["extra"] = "forbid"
         argument_model.model_rebuild(force=True)
         tool.parameters = argument_model.model_json_schema(by_alias=True)
+        _drop_null_schema_defaults(tool.parameters)
 
 
 _enforce_strict_tool_arguments(
+    *tuple(MUTATION_EFFECTS),
+    "describe_connection_convention",
+    "list_environments",
+    "check_environment",
+    "list_integrations",
+    "get_integration",
+    "search_provider_templates",
+    "list_connections",
+    "get_connection",
+    "get_connection_context",
     "proxy_request",
     "query_response_artifact",
     "download_provider_file",
+    "build_connection_convention",
+    "audit_connection_conventions",
 )
 
 

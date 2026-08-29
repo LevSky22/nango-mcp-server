@@ -394,7 +394,7 @@ class NangoClient:
     async def import_connection(self, secret_key: str, payload: dict[str, Any]) -> Any:
         return await self._request(secret_key, "POST", "/connections", body=payload)
 
-    async def patch_connection_tags(
+    async def replace_connection_tags(
         self,
         secret_key: str,
         connection_id: str,
@@ -403,17 +403,19 @@ class NangoClient:
     ) -> Any:
         return await self.patch_connection(secret_key, connection_id, provider_config_key, tags=tags)
 
-    async def set_connection_metadata(
+    async def update_connection_metadata(
         self,
         secret_key: str,
         connection_id: str,
         provider_config_key: str,
         metadata: dict[str, Any],
         *,
-        patch: bool = False,
+        mode: str = "merge",
     ) -> Any:
+        if mode not in {"merge", "replace"}:
+            raise ValueError("mode must be merge or replace")
         body = {"connection_id": connection_id, "provider_config_key": provider_config_key, "metadata": metadata}
-        method = "PATCH" if patch else "POST"
+        method = "PATCH" if mode == "merge" else "POST"
         return await self._request(secret_key, method, "/connections/metadata", body=body)
 
     async def delete_connection(self, secret_key: str, connection_id: str, provider_config_key: str) -> Any:
