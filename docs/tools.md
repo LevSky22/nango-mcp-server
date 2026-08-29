@@ -104,11 +104,15 @@ All tools that accept `environment` enforce the authenticated caller's environme
 
 ## Provider API and large responses
 
+### `stage_proxy_request_body`
+
+**Write, local staging.** Stores an outbound JSON mutation body as an immutable, expiring, caller/environment-bound artifact and returns only a descriptor. It has no resource or query interface. Use it when `proxy_request` returns `INLINE_BODY_REQUIRES_STAGING`, then retry with `bodyArtifactId` and omit `body`.
+
 ### `proxy_request`
 
-**Read/write.** Calls a provider API through Nango Proxy without exposing provider tokens. GET and HEAD are read operations; other methods are mutations and require approval. Its public contract uses strict camelCase names and rejects unknown arguments.
+**Read/write.** Calls a provider API through Nango Proxy without exposing provider tokens. GET, HEAD, and OPTIONS are read operations; other methods are mutations and require approval. Under trusted-host policy, only conservative exact-target DELETE routes can delegate approval; collection, bulk, wildcard, template, query, and body deletes stay server-approved. Its public contract uses strict camelCase names and rejects unknown arguments.
 
-Small JSON results remain inline. Large results return a bounded preview, `responseMeta`, and an optional descriptor link using `nango-mcp://artifact/<id>`. Use `responseMode`, `responsePath`, `fields`, `filters`, `pageSize`, and `cursor` to control the returned view. Provider JSON beneath `response` is preserved verbatim. Complete object/array JSON is recognized even when a provider sends a missing or incorrect media type, with an explicit warning.
+Small JSON results remain inline. Large results return a bounded preview, `responseMeta`, and an optional descriptor link using `nango-mcp://artifact/<id>`. Use `responseMode`, `responsePath`, `fields`, `filters`, `pageSize`, and `cursor` to control the returned view. Provider JSON beneath `response` is preserved verbatim. Complete object/array JSON is recognized even when a provider sends a missing or incorrect media type, with an explicit warning. Mutation bodies larger than the advertised inline limits must be staged; `body` and `bodyArtifactId` are mutually exclusive.
 
 ### `query_response_artifact`
 
@@ -141,6 +145,6 @@ These helpers provide generic tag and metadata conventions. They are optional an
 - Management API results recursively redact credential-like field names.
 - Mutations are disabled when `NANGO_MCP_READ_ONLY=true`.
 - Caller policy can deny tools, restrict environments and proxy methods, and force approval for selected proxy paths.
-- Destructive operations always require server-bound approval.
+- Destructive management tools remain server-approved. Exact-target provider DELETE routes may delegate to trusted host policy; ambiguous or broad deletes remain server-approved.
 - Large provider responses use bounded structured output plus protected artifacts; provider downloads use protected binary resources.
 - JSON artifact resource reads are descriptor-only; binary download reads return bytes. Both are authorized against the original caller and environment scope.

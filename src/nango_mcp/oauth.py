@@ -64,8 +64,11 @@ def caller_scope_from_access_token(access_token: AccessToken) -> CallerScope:
     )
     if not environments:
         raise PermissionError("access token does not grant a Nango environment")
+    can_read = "nango:read" in scopes
+    can_write = "nango:write" in scopes
+    can_proxy = "nango:proxy" in scopes
     denied_tools: set[str] = set()
-    if "nango:read" not in scopes:
+    if not can_read:
         denied_tools.update({
             "describe_connection_convention", "list_environments", "check_environment",
             "list_integrations", "get_integration", "search_provider_templates",
@@ -73,20 +76,32 @@ def caller_scope_from_access_token(access_token: AccessToken) -> CallerScope:
             "build_connection_convention", "audit_connection_conventions",
             "query_response_artifact",
         })
-    if "nango:write" not in scopes:
+    if not can_write:
         denied_tools.update({
             "create_integration", "update_integration", "delete_integration",
             "refresh_connection_credentials", "import_connection", "delete_connection",
             "replace_connection_tags", "update_connection_metadata", "create_connect_session",
             "create_standard_connect_session", "create_reconnect_session",
-            "apply_connection_convention",
+            "apply_connection_convention", "stage_proxy_request_body",
         })
-    if "nango:proxy" not in scopes:
-        denied_tools.update({"proxy_request", "download_provider_file"})
+    if not can_proxy:
+        denied_tools.update({"proxy_request", "download_provider_file", "stage_proxy_request_body"})
+    if not (can_proxy and can_read):
+        denied_tools.add("download_provider_file")
+    if can_proxy and can_read and can_write:
+        allowed_proxy_methods = frozenset({"*"})
+    else:
+        allowed_methods: set[str] = set()
+        if can_proxy and can_read:
+            allowed_methods.update({"GET", "HEAD", "OPTIONS"})
+        if can_proxy and can_write:
+            allowed_methods.update({"POST", "PUT", "PATCH", "DELETE"})
+        allowed_proxy_methods = frozenset(allowed_methods)
     return CallerScope(
         label=access_token.subject or access_token.client_id,
         environments=environments,
         denied_tools=frozenset(denied_tools),
+        allowed_proxy_methods=allowed_proxy_methods,
     )
 
 
