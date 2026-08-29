@@ -108,13 +108,13 @@ All tools that accept `environment` enforce the authenticated caller's environme
 
 **Read/write.** Calls a provider API through Nango Proxy without exposing provider tokens. GET and HEAD are read operations; other methods are mutations and require approval. Its public contract uses strict camelCase names and rejects unknown arguments.
 
-Small JSON results remain inline. Large results return a bounded preview, `responseMeta`, and a protected `nango-mcp://artifact/<id>` resource link. Use `responseMode`, `responsePath`, `fields`, `filters`, `pageSize`, and `cursor` to control the returned view. Provider JSON beneath `response` is preserved verbatim.
+Small JSON results remain inline. Large results return a bounded preview, `responseMeta`, and an optional descriptor link using `nango-mcp://artifact/<id>`. Use `responseMode`, `responsePath`, `fields`, `filters`, `pageSize`, and `cursor` to control the returned view. Provider JSON beneath `response` is preserved verbatim. Complete object/array JSON is recognized even when a provider sends a missing or incorrect media type, with an explicit warning.
 
 ### `query_response_artifact`
 
-**Read.** Queries a stored response artifact without loading the complete representation into model context. It supports JSON Pointer selection, field projection, filters, signed pagination cursors, shape description, keyed-object entry views, and literal text search. Inputs use strict camelCase and unknown arguments are rejected.
+**Read.** Queries a contract-v2 stored response artifact without loading the complete representation into model context. It supports JSON Pointer selection, field projection, filters, signed pagination cursors, shape description, keyed-object entry views, and literal text search. Exact pointers win; a missing provider-relative pointer is tried beneath `/response` and the canonical selection is returned. Inputs use strict camelCase and unknown arguments are rejected.
 
-Hosts may instead read the immutable complete artifact with MCP `resources/read`, subject to caller and environment authorization.
+MCP `resources/read` returns only a bounded, authorized descriptor for JSON artifacts. `query_response_artifact` is the only model-facing JSON value reader.
 
 ## Optional connection conventions
 
@@ -143,4 +143,4 @@ These helpers provide generic tag and metadata conventions. They are optional an
 - Caller policy can deny tools, restrict environments and proxy methods, and force approval for selected proxy paths.
 - Destructive operations always require server-bound approval.
 - Large provider responses use bounded structured output plus protected artifacts; provider downloads use protected binary resources.
-- Artifact and download resource reads are authorized against the original caller and environment scope.
+- JSON artifact resource reads are descriptor-only; binary download reads return bytes. Both are authorized against the original caller and environment scope.

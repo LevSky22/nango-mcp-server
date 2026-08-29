@@ -262,6 +262,44 @@ async def test_proxy_request_returns_http_envelope() -> None:
     }
 
 
+@pytest.mark.parametrize("content_type", ["application/problem+json", "text/plain", ""])
+def test_proxy_response_recovers_complete_structured_json(content_type: str) -> None:
+    client = NangoClient("https://nango.example.test")
+    response = httpx.Response(
+        200,
+        content=b'{"items":[{"id":"item-1"}]}',
+        headers={"content-type": content_type} if content_type else {},
+        request=httpx.Request("GET", "https://nango.example.test/proxy/items"),
+    )
+
+    envelope = client._response_envelope(response)
+
+    assert envelope["response"] == {"items": [{"id": "item-1"}]}
+    if content_type == "application/problem+json":
+        assert "response_warning" not in envelope
+    else:
+        assert "non-JSON Content-Type" in envelope["response_warning"]
+
+
+def test_proxy_response_does_not_infer_partial_or_scalar_json() -> None:
+    client = NangoClient("https://nango.example.test")
+    partial = httpx.Response(
+        200,
+        content=b'{"items": [',
+        headers={"content-type": "text/plain"},
+        request=httpx.Request("GET", "https://nango.example.test/proxy/items"),
+    )
+    scalar = httpx.Response(
+        200,
+        content=b'42',
+        headers={"content-type": "text/plain"},
+        request=httpx.Request("GET", "https://nango.example.test/proxy/items"),
+    )
+
+    assert client._response_envelope(partial)["response"]["body"] == '{"items": ['
+    assert client._response_envelope(scalar)["response"]["body"] == "42"
+
+
 @pytest.mark.asyncio
 async def test_proxy_request_returns_provider_error_envelope() -> None:
     class ErrorNangoClient(CapturingNangoClient):

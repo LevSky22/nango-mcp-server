@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
 import time
@@ -68,43 +69,67 @@ class NangoClient:
         self.max_keepalive = max_keepalive
         self._http: httpx.AsyncClient | None = None
 
-    def _parse_response_body(self, response: httpx.Response) -> Any:
+    def _parse_response_body_with_interpretation(self, response: httpx.Response) -> tuple[Any, str]:
         if not response.content:
-            return None
+            return None, "empty"
 
         content_type = response.headers.get("content-type", "")
-        content_type_lower = content_type.lower()
-        if "application/json" in content_type_lower:
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        declared_json = media_type == "application/json" or media_type.endswith("+json")
+        if declared_json:
             try:
-                return response.json()
+                return response.json(), "declared_json"
             except ValueError:
                 text = response.text
-                return {
-                    "body": text[:MAX_TEXT_BODY_CHARS],
-                    "truncated": len(text) > MAX_TEXT_BODY_CHARS,
-                    "parse_error": "invalid_json",
-                }
+                return (
+                    {
+                        "body": text[:MAX_TEXT_BODY_CHARS],
+                        "truncated": len(text) > MAX_TEXT_BODY_CHARS,
+                        "parse_error": "invalid_json",
+                    },
+                    "invalid_declared_json",
+                )
+
+        candidate = response.content
+        if candidate.startswith(b"\xef\xbb\xbf"):
+            candidate = candidate[3:]
+        if candidate.lstrip(b" \t\r\n")[:1] in {b"{", b"["}:
+            try:
+                parsed = json.loads(candidate)
+            except (ValueError, UnicodeDecodeError):
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                return parsed, "inferred_json"
 
         if (
-            content_type_lower.startswith("text/")
-            or "xml" in content_type_lower
-            or "html" in content_type_lower
-            or "application/x-www-form-urlencoded" in content_type_lower
+            media_type.startswith("text/")
+            or "xml" in media_type
+            or "html" in media_type
+            or media_type == "application/x-www-form-urlencoded"
         ):
             text = response.text
-            return {
-                "body": text[:MAX_TEXT_BODY_CHARS],
-                "truncated": len(text) > MAX_TEXT_BODY_CHARS,
-            }
+            return (
+                {
+                    "body": text[:MAX_TEXT_BODY_CHARS],
+                    "truncated": len(text) > MAX_TEXT_BODY_CHARS,
+                },
+                "text",
+            )
 
         body = response.content
         clipped = body[:MAX_BINARY_BODY_BYTES]
-        return {
-            "body_base64": base64.b64encode(clipped).decode("ascii"),
-            "encoding": "base64",
-            "byte_length": len(body),
-            "truncated": len(body) > MAX_BINARY_BODY_BYTES,
-        }
+        return (
+            {
+                "body_base64": base64.b64encode(clipped).decode("ascii"),
+                "encoding": "base64",
+                "byte_length": len(body),
+                "truncated": len(body) > MAX_BINARY_BODY_BYTES,
+            },
+            "binary",
+        )
+
+    def _parse_response_body(self, response: httpx.Response) -> Any:
+        return self._parse_response_body_with_interpretation(response)[0]
 
     def _safe_response_headers(self, headers: httpx.Headers) -> dict[str, str]:
         safe: dict[str, str] = {}
@@ -115,13 +140,20 @@ class NangoClient:
         return safe
 
     def _response_envelope(self, response: httpx.Response) -> dict[str, Any]:
-        return {
+        body, interpretation = self._parse_response_body_with_interpretation(response)
+        envelope = {
             "ok": response.status_code < 400,
             "status": response.status_code,
             "content_type": response.headers.get("content-type", ""),
             "response_headers": self._safe_response_headers(response.headers),
-            "response": self._parse_response_body(response),
+            "response": body,
         }
+        if interpretation == "inferred_json":
+            envelope["response_warning"] = (
+                "Provider returned structured JSON with a non-JSON Content-Type; "
+                "the MCP parsed the complete document structurally."
+            )
+        return envelope
 
     def _with_self_hosted_api_url(self, connect_link: str) -> str:
         parts = urlsplit(connect_link)

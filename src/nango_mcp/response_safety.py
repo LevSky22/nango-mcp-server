@@ -19,6 +19,16 @@ HARD_RESULT_BUDGET_BYTES = 128 * 1024
 DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 100
 ARTIFACT_QUOTA_BYTES = 1024 * 1024 * 1024
+RESPONSE_CONTRACT_VERSION = 2
+NANGO_RESPONSE_ROOT = "/response"
+_PROXY_ENVELOPE_POINTERS = frozenset({
+    "/ok",
+    "/status",
+    "/contentType",
+    "/responseHeaders",
+    "/rateLimit",
+    "/responseMeta",
+})
 _MISSING = object()
 _ARRAY_INDEX = re.compile(r"(?:0|[1-9][0-9]*)")
 
@@ -76,16 +86,98 @@ def _pointer(value: Any, pointer: str) -> Any:
     return current
 
 
-def _invalid_response_path(error: JsonPointerResolutionError, response_root: str) -> ValueError:
-    location = "the document root" if error.resolved_path == "" else f'"{error.resolved_path}"'
+def _response_root_candidate(requested_path: str, response_root: str) -> str | None:
+    """Return the unambiguous response-root-relative form of a missing pointer."""
+    if (
+        not response_root
+        or requested_path == ""
+        or requested_path == response_root
+        or requested_path.startswith(f"{response_root}/")
+    ):
+        return None
+    return f"{response_root}{requested_path}"
+
+
+def _exact_envelope_collision_warning(
+    document: Any,
+    requested_path: str,
+    response_root: str,
+) -> str | None:
+    if requested_path not in _PROXY_ENVELOPE_POINTERS:
+        return None
+    candidate = _response_root_candidate(requested_path, response_root)
+    if candidate is None:
+        return None
+    try:
+        _pointer(document, candidate)
+    except JsonPointerResolutionError:
+        return None
+    return (
+        f'Exact responsePath "{requested_path}" selected an MCP envelope field, while '
+        f'provider data also exists at "{candidate}". Exact pointers remain authoritative; '
+        f'use "{candidate}" to select the provider value.'
+    )
+
+
+def _append_warning(metadata: dict[str, Any], note: str | None) -> None:
+    if not note:
+        return
+    existing = metadata.get("warning")
+    metadata["warning"] = f"{existing} {note}" if existing else note
+
+
+def _invalid_response_path(
+    error: JsonPointerResolutionError,
+    response_root: str,
+    *,
+    attempted_path: str | None = None,
+    attempted_error: JsonPointerResolutionError | None = None,
+) -> ValueError:
+    diagnostic = attempted_error or error
+    location = "the document root" if diagnostic.resolved_path == "" else f'"{diagnostic.resolved_path}"'
+    attempted = (
+        f' as an absolute pointer or relative to responseRoot={json.dumps(response_root)} '
+        f'(tried "{attempted_path}")'
+        if attempted_path is not None
+        else ""
+    )
     return ValueError(
-        f'INVALID_RESPONSE_PATH: "{error.requested_path}" does not exist. '
-        f'{location} resolves to {_type_name(error.selected_value)} and has no '
-        f'"{error.failed_token}" child. Available children: '
-        f'{_describe_available_keys(error.selected_value)}. Retry without responsePath '
+        f'INVALID_RESPONSE_PATH: "{error.requested_path}" does not exist{attempted}. '
+        f'{location} resolves to {_type_name(diagnostic.selected_value)} and has no '
+        f'"{diagnostic.failed_token}" child. Available children: '
+        f'{_describe_available_keys(diagnostic.selected_value)}. Retry without responsePath '
         f'to use responseRoot={json.dumps(response_root)}, or call with describe=true '
         "at a valid parent pointer."
     )
+
+
+def _select_response_path(
+    document: Any,
+    requested_path: str,
+    response_root: str,
+) -> tuple[Any, str, str | None, str | None]:
+    """Resolve an exact pointer first, then a response-root-relative shorthand."""
+    try:
+        selected = _pointer(document, requested_path)
+        return (
+            selected,
+            requested_path,
+            None,
+            _exact_envelope_collision_warning(document, requested_path, response_root),
+        )
+    except JsonPointerResolutionError as error:
+        candidate = _response_root_candidate(requested_path, response_root)
+        if candidate is None:
+            raise _invalid_response_path(error, response_root) from error
+        try:
+            return _pointer(document, candidate), candidate, candidate, None
+        except JsonPointerResolutionError as attempted_error:
+            raise _invalid_response_path(
+                error,
+                response_root,
+                attempted_path=candidate,
+                attempted_error=attempted_error,
+            ) from error
 
 
 def _field_pointer(field: str) -> str:
@@ -200,9 +292,9 @@ def _primary_paths(document: Any) -> list[str]:
     prefix = ""
     paths: list[str] = []
     if isinstance(document, dict) and "response" in document:
-        paths.append("/response")
+        paths.append(NANGO_RESPONSE_ROOT)
         root = document["response"]
-        prefix = "/response"
+        prefix = NANGO_RESPONSE_ROOT
     if isinstance(root, list):
         return paths or [""]
     if isinstance(root, dict):
@@ -404,6 +496,37 @@ def _project_selection(selected: Any, fields: list[str]) -> tuple[Any, dict[str,
     return projected_one, resolved
 
 
+def _relative_fields_for_inferred_array(fields: list[str], child_path: str) -> list[str] | None:
+    """Remove one redundant collection prefix only when every field uses it."""
+    prefix = f"{child_path}/"
+    normalized: list[str] = []
+    for field in fields:
+        pointer = _field_pointer(field)
+        if not pointer.startswith(prefix):
+            return None
+        relative = pointer[len(child_path):]
+        if relative in {"", "/"}:
+            return None
+        normalized.append(relative)
+    return normalized
+
+
+def _restore_projected_field_labels(
+    projected: list[dict[str, Any]],
+    requested_fields: list[str],
+    effective_fields: list[str],
+) -> list[dict[str, Any]]:
+    """Keep caller-visible projection keys stable after a safe pointer rewrite."""
+    return [
+        {
+            requested: item[effective]
+            for requested, effective in zip(requested_fields, effective_fields, strict=True)
+            if effective in item
+        }
+        for item in projected
+    ]
+
+
 def _completion_metadata(
     *,
     truncated: bool,
@@ -429,7 +552,7 @@ def _completion_metadata(
 def _sign(payload: bytes, key: str) -> str:
     state = json.loads(payload)
     if isinstance(state, dict):
-        state = {"contractVersion": 1, **state}
+        state = {"contractVersion": RESPONSE_CONTRACT_VERSION, **state}
         payload = serialized_bytes(state)
     signature = hmac.new(key.encode("utf-8"), payload, hashlib.sha256).digest()
     return _b64url(payload + signature)
@@ -445,10 +568,12 @@ def _unsign(token: str, key: str) -> dict[str, Any]:
         decoded = json.loads(payload)
         if not isinstance(decoded, dict):
             raise ValueError
-        if decoded.get("contractVersion") != 1:
-            raise ValueError
+        if decoded.get("contractVersion") != RESPONSE_CONTRACT_VERSION:
+            raise ValueError("unsupported response cursor contract version; re-run the query to mint a v2 cursor")
         return decoded
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        if "unsupported response cursor contract version" in str(exc):
+            raise
         raise ValueError("invalid or expired response cursor") from exc
 
 
@@ -584,7 +709,7 @@ def _search_string_values(
                 if truncated:
                     return
 
-    visit(selected, "" if response_path == "" else response_path.rstrip("/"))
+    visit(selected, response_path)
     return matches, truncated
 
 
@@ -723,14 +848,14 @@ class ArtifactStore:
         expires_at_epoch = int(time.time()) + self.ttl_seconds
         expires_at = datetime.fromtimestamp(expires_at_epoch, timezone.utc).isoformat().replace("+00:00", "Z")
         metadata = {
-            "contractVersion": 1,
+            "contractVersion": RESPONSE_CONTRACT_VERSION,
             "owner": owner,
             "environment": environment,
             "mediaType": "application/json",
             "byteLength": len(content),
             "sha256": digest,
             "expiresAt": expires_at,
-            "responseRoot": "/response",
+            "responseRoot": NANGO_RESPONSE_ROOT,
             "primaryPaths": _primary_paths(value),
             "sourceTruncated": False,
         }
@@ -770,10 +895,10 @@ class ArtifactStore:
                 "response artifact handle is unknown: it was never created, or it was pruned. "
                 "re-run the tool that produced it to mint a new artifact"
             ) from exc
-        if metadata.get("contractVersion") != 1:
+        if metadata.get("contractVersion") != RESPONSE_CONTRACT_VERSION:
             raise ValueError(
-                "response artifact uses an unsupported contract version; "
-                "re-run the tool that produced it"
+                "response artifact uses an unsupported contract version; re-run the provider "
+                "request to mint a v2 artifact"
             )
         if not data_path.exists():
             # Previously surfaced as an unhandled FileNotFoundError on first read.
@@ -804,7 +929,7 @@ class ArtifactStore:
         _, metadata = self._load(artifact_id, owner=owner, environment=environment)
         return {
             "descriptorVersion": 1,
-            "contractVersion": 1,
+            "contractVersion": RESPONSE_CONTRACT_VERSION,
             "id": artifact_id,
             "mediaType": metadata["mediaType"],
             "byteLength": metadata["byteLength"],
@@ -814,12 +939,30 @@ class ArtifactStore:
             "responseRoot": metadata["responseRoot"],
             "primaryPaths": metadata.get("primaryPaths", []),
             "sourceTruncated": bool(metadata.get("sourceTruncated", False)),
-            "rawReadable": True,
+            "rawReadable": False,
             "guidance": (
-                "Use resources/read for the complete immutable representation, or "
-                "query_response_artifact for a bounded structured view."
+                "Use query_response_artifact for a bounded structured view. resources/read "
+                "returns this descriptor and never the stored provider payload."
             ),
         }
+
+    def describe_authorized(
+        self,
+        artifact_id: str,
+        *,
+        owner: str,
+        environments: frozenset[str],
+    ) -> dict[str, Any]:
+        """Describe a capability only when its environment is in the caller scope."""
+        _, meta_path = self._paths(artifact_id)
+        try:
+            metadata = json.loads(meta_path.read_text("utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            raise ValueError("response artifact handle is unavailable") from exc
+        environment = str(metadata.get("environment") or "")
+        if environment not in environments:
+            raise PermissionError("response artifact handle is unavailable")
+        return self.describe(artifact_id, owner=owner, environment=environment)
 
     def read(self, artifact_id: str, *, owner: str, environment: str) -> tuple[bytes, dict[str, Any]]:
         data_path, metadata = self._load(artifact_id, owner=owner, environment=environment)
@@ -917,11 +1060,13 @@ class ArtifactStore:
             environment=environment,
         )
         document = _load_document(artifact_id, data_path)
-        response_path = response_path if response_path is not None else str(metadata["responseRoot"])
-        try:
-            selected = _pointer(document, response_path)
-        except JsonPointerResolutionError as error:
-            raise _invalid_response_path(error, str(metadata["responseRoot"])) from error
+        response_root = str(metadata["responseRoot"])
+        response_path = response_path if response_path is not None else response_root
+        selected, response_path, inferred_response_path, selection_warning = _select_response_path(
+            document,
+            response_path,
+            response_root,
+        )
         if text_search is not None:
             if describe or fields or filters or object_mode is not None or cursor:
                 raise ValueError(
@@ -933,7 +1078,7 @@ class ArtifactStore:
                 "responsePath": response_path,
                 "response": matches,
                 "responseMeta": {
-                    "contractVersion": 1,
+                    "contractVersion": RESPONSE_CONTRACT_VERSION,
                     "truncated": truncated,
                     "complete": not truncated,
                     "truncationReason": "match_limit" if truncated else None,
@@ -949,12 +1094,15 @@ class ArtifactStore:
                     ),
                 },
             }
+            if inferred_response_path is not None:
+                result["responseMeta"]["inferredResponsePath"] = inferred_response_path
+            _append_warning(result["responseMeta"], selection_warning)
             result["responseMeta"]["serializedBytes"] = emitted_bytes(result)
             return result
         if describe:
-            base = "" if response_path == "" else response_path.rstrip("/")
+            base = response_path
             view_hash = hashlib.sha256(serialized_bytes({
-                "contractVersion": 1,
+                "contractVersion": RESPONSE_CONTRACT_VERSION,
                 "artifactId": artifact_id,
                 "responsePath": response_path,
                 "describe": True,
@@ -992,7 +1140,7 @@ class ArtifactStore:
                 "responsePath": response_path,
                 "shape": shape,
                 "responseMeta": {
-                    "contractVersion": 1,
+                    "contractVersion": RESPONSE_CONTRACT_VERSION,
                     "truncated": next_cursor is not None,
                     "truncationReason": "page_limit" if next_cursor else None,
                     "returnedCount": returned_keys,
@@ -1008,6 +1156,9 @@ class ArtifactStore:
                     ),
                 },
             }
+            if inferred_response_path is not None:
+                result["responseMeta"]["inferredResponsePath"] = inferred_response_path
+            _append_warning(result["responseMeta"], selection_warning)
             result["responseMeta"]["serializedBytes"] = emitted_bytes(result)
             return result
         if object_mode is not None:
@@ -1026,18 +1177,39 @@ class ArtifactStore:
                 raise ValueError("filters require responsePath to select a JSON array")
             selected, filter_stats = _apply_filters(selected, filters)
         fields_resolved: dict[str, int] | None = None
+        field_normalization_warning: str | None = None
         if fields:
             try:
                 selected, fields_resolved = _project_selection(selected, fields)
             except ValueError as error:
-                if "fields matched no properties" in str(error) and _is_keyed_object(selected):
-                    raise _object_mode_required(
-                        artifact_id, response_path, response_page_size, fields, filters
-                    ) from error
-                raise
+                inferred = _single_array_child(selected) if "fields matched no properties" in str(error) else None
+                if inferred is None:
+                    if "fields matched no properties" in str(error) and _is_keyed_object(selected):
+                        raise _object_mode_required(
+                            artifact_id, response_path, response_page_size, fields, filters
+                        ) from error
+                    raise
+                child_path, selected = inferred
+                inferred_response_path = _join_response_path(response_path, child_path)
+                try:
+                    selected, fields_resolved = _project_selection(selected, fields)
+                except ValueError as inferred_error:
+                    normalized_fields = _relative_fields_for_inferred_array(fields, child_path)
+                    if normalized_fields is None or "fields matched no properties" not in str(inferred_error):
+                        raise
+                    normalized_selection, normalized_resolved = _project_selection(selected, normalized_fields)
+                    selected = _restore_projected_field_labels(normalized_selection, fields, normalized_fields)
+                    fields_resolved = {
+                        requested: normalized_resolved[effective]
+                        for requested, effective in zip(fields, normalized_fields, strict=True)
+                    }
+                    field_normalization_warning = (
+                        f"Inferred collection {inferred_response_path} and interpreted fields "
+                        f"relative to each item: {', '.join(normalized_fields)}."
+                    )
 
         view_hash = hashlib.sha256(serialized_bytes({
-            "contractVersion": 1,
+            "contractVersion": RESPONSE_CONTRACT_VERSION,
             "artifactId": artifact_id,
             "responsePath": response_path,
             "objectMode": object_mode,
@@ -1096,7 +1268,7 @@ class ArtifactStore:
             "responsePath": response_path,
             "response": output,
             "responseMeta": {
-                "contractVersion": 1,
+                "contractVersion": RESPONSE_CONTRACT_VERSION,
                 "truncated": truncated,
                 "truncationReason": reason,
                 "returnedCount": returned_count,
@@ -1114,6 +1286,10 @@ class ArtifactStore:
         }
         if filter_stats is not None:
             result["responseMeta"]["filtersApplied"] = filter_stats
+        if inferred_response_path is not None:
+            result["responseMeta"]["inferredResponsePath"] = inferred_response_path
+        _append_warning(result["responseMeta"], selection_warning)
+        _append_warning(result["responseMeta"], field_normalization_warning)
         if fields_resolved is not None:
             result["responseMeta"]["fieldsResolved"] = fields_resolved
             missing = [field for field, count in fields_resolved.items() if count == 0]
@@ -1146,6 +1322,7 @@ def bound_proxy_response(
     response_filter: list[dict[str, Any]] | None = None,
     response_page_size: int = DEFAULT_PAGE_SIZE,
     response_cursor: str | None = None,
+    response_warning: str | None = None,
 ) -> dict[str, Any]:
     if response_mode not in {"auto", "summary", "full", "artifact"}:
         raise ValueError("responseMode must be auto, summary, full, or artifact")
@@ -1159,14 +1336,15 @@ def bound_proxy_response(
     # queries are not silently limited to whatever this call happened to project.
     artifact_bytes = serialized_bytes(envelope)
 
-    effective_response_path = response_path if response_path is not None else "/response"
-    try:
-        selected = _pointer(envelope, effective_response_path)
-    except JsonPointerResolutionError as error:
-        raise _invalid_response_path(error, "/response") from error
-    inferred_response_path: str | None = None
+    effective_response_path = response_path if response_path is not None else NANGO_RESPONSE_ROOT
+    selected, effective_response_path, inferred_response_path, selection_warning = _select_response_path(
+        envelope,
+        effective_response_path,
+        NANGO_RESPONSE_ROOT,
+    )
     filter_stats: list[dict[str, Any]] | None = None
     fields_resolved: dict[str, int] | None = None
+    field_normalization_warning: str | None = None
     if filters:
         if not isinstance(selected, list):
             inferred = _single_array_child(selected)
@@ -1186,7 +1364,22 @@ def bound_proxy_response(
                 raise
             child_path, selected = inferred
             inferred_response_path = _join_response_path(effective_response_path, child_path)
-            selected, fields_resolved = _project_selection(selected, fields)
+            try:
+                selected, fields_resolved = _project_selection(selected, fields)
+            except ValueError as inferred_error:
+                normalized_fields = _relative_fields_for_inferred_array(fields, child_path)
+                if normalized_fields is None or "fields matched no properties" not in str(inferred_error):
+                    raise
+                normalized_selection, normalized_resolved = _project_selection(selected, normalized_fields)
+                selected = _restore_projected_field_labels(normalized_selection, fields, normalized_fields)
+                fields_resolved = {
+                    requested: normalized_resolved[effective]
+                    for requested, effective in zip(fields, normalized_fields, strict=True)
+                }
+                field_normalization_warning = (
+                    f"Inferred collection {inferred_response_path} and interpreted fields "
+                    f"relative to each item: {', '.join(normalized_fields)}."
+                )
 
     full_value = {**envelope, "response": selected}
     oversized = len(artifact_bytes) > INLINE_BUDGET_BYTES
@@ -1259,7 +1452,7 @@ def bound_proxy_response(
         **envelope,
         "response": output_response,
         "responseMeta": {
-            "contractVersion": 1,
+            "contractVersion": RESPONSE_CONTRACT_VERSION,
             "truncated": truncated,
             "truncationReason": reason,
             "returnedCount": returned_count,
@@ -1280,6 +1473,9 @@ def bound_proxy_response(
         result["responseMeta"]["filtersApplied"] = filter_stats
     if inferred_response_path is not None:
         result["responseMeta"]["inferredResponsePath"] = inferred_response_path
+    _append_warning(result["responseMeta"], selection_warning)
+    _append_warning(result["responseMeta"], response_warning)
+    _append_warning(result["responseMeta"], field_normalization_warning)
     if fields_resolved is not None:
         result["responseMeta"]["fieldsResolved"] = fields_resolved
         missing = [field for field, count in fields_resolved.items() if count == 0]

@@ -169,9 +169,9 @@ Approval state is time-limited and bound to the caller policy, environment, tool
 
 - a bounded preview in `structuredContent`
 - `responseMeta` with completeness, pagination, and artifact metadata
-- a `resource_link` using `nango-mcp://artifact/<id>`
+- an optional descriptor `resource_link` using `nango-mcp://artifact/<id>`
 
-The host can fetch the complete immutable representation with MCP `resources/read`. Models should use `query_response_artifact` for bounded selection, projection, filtering, shape description, pagination, keyed-object entries, or literal text search.
+`resources/read` returns bounded metadata only and never the stored provider payload. Models use `query_response_artifact` as the sole JSON value reader for bounded selection, projection, filtering, shape description, pagination, keyed-object entries, or literal text search. Binary links returned by `download_provider_file` remain directly readable resources.
 
 This hybrid follows MCP's separation of concerns: tools initiate computation, resources carry application-controlled context, and resource links let hosts decide whether full content enters model context. See the MCP guidance for [resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources) and [tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools).
 
@@ -189,7 +189,7 @@ Override storage with `NANGO_MCP_ARTIFACT_ROOT`, `NANGO_MCP_ARTIFACT_MAX_BYTES`,
 
 `download_provider_file` streams a provider GET with `Accept: */*`, enforces the size limit, computes SHA-256, and returns `nango-mcp://download/<id>` as a protected resource link. Results never expose a server filesystem path.
 
-## Proxy v1 contract
+## Proxy v2 contract
 
 Every tool uses strict camelCase wire names. Unknown arguments and legacy snake_case spellings are rejected.
 
@@ -210,7 +210,7 @@ environment, artifactId, responsePath, fields, filters,
 pageSize, cursor, describe, objectMode, textSearch
 ```
 
-Paths use RFC 6901 JSON Pointer. `pageSize` defaults to 20 and is capped at 100. Cursors are signed and bound to the caller, environment, artifact, and query view.
+Paths use RFC 6901 JSON Pointer. Exact document pointers win; when an absolute pointer is absent, the server tries it once beneath the advertised `/response` root and reports the canonical path. `pageSize` defaults to 20 and is capped at 100. Contract-v2 cursors are signed and bound to the caller, environment, artifact, and query view.
 
 Rate-limit handling distinguishes Nango gateway throttles from forwarded provider throttles by Nango's response body. Gateway rejections are safe to retry for any method because they were not forwarded. Provider rejections are replayed only for GET, HEAD, and OPTIONS.
 
