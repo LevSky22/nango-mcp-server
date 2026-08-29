@@ -1505,3 +1505,183 @@ def bound_proxy_response(
     if emitted > HARD_RESULT_BUDGET_BYTES:
         raise RuntimeError("bounded MCP result unexpectedly exceeded its hard serialized-size limit")
     return result
+
+
+_LAST_MUTATION_BODY_PRUNE = 0.0
+
+
+class MutationBodyStore:
+    """Immutable, caller/environment-bound outbound JSON bodies.
+
+    Request-body artifacts have no resource, list, query, or raw-read interface. The
+    provider proxy is their only consumer and verifies content identity before sending.
+    """
+
+    def __init__(self, root: str, key: str, ttl_seconds: int, max_bytes: int) -> None:
+        self.root = Path(root) if root else None
+        self.key = key
+        self.ttl_seconds = ttl_seconds
+        self.max_bytes = max_bytes
+
+    def _paths(self, artifact_id: str) -> tuple[Path, Path]:
+        if self.root is None:
+            raise RuntimeError("mutation body artifact storage is not configured")
+        return (
+            self.root / f"mutation-body-{artifact_id}.json",
+            self.root / f"mutation-body-{artifact_id}.meta.json",
+        )
+
+    def prune(self, *, force: bool = False) -> None:
+        global _LAST_MUTATION_BODY_PRUNE
+        if self.root is None or (not force and time.time() - _LAST_MUTATION_BODY_PRUNE < 60):
+            return
+        _LAST_MUTATION_BODY_PRUNE = time.time()
+        cutoff = time.time() - self.ttl_seconds
+        self.root.mkdir(parents=True, exist_ok=True)
+        data_entries: list[tuple[Path, os.stat_result]] = []
+        for entry in self.root.glob("mutation-body-*"):
+            try:
+                if entry.is_file() and not entry.is_symlink() and entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+                elif entry.is_file() and not entry.is_symlink() and not entry.name.endswith(".meta.json"):
+                    data_entries.append((entry, entry.stat()))
+            except FileNotFoundError:
+                pass
+        total = sum(stat.st_size for _, stat in data_entries)
+        for entry, stat in sorted(data_entries, key=lambda item: item[1].st_mtime):
+            if total <= ARTIFACT_QUOTA_BYTES:
+                break
+            entry.unlink(missing_ok=True)
+            entry.with_name(entry.name.replace(".json", ".meta.json")).unlink(missing_ok=True)
+            total -= stat.st_size
+
+    @staticmethod
+    def _shape(value: Any) -> dict[str, Any]:
+        descriptor: dict[str, Any] = {"rootType": _type_name(value)}
+        if isinstance(value, dict):
+            entries = sorted(value.items(), key=lambda item: str(item[0]))[:24]
+            bounded_names = [(str(key)[:120], child) for key, child in entries]
+            descriptor["topLevelFields"] = [name for name, _ in bounded_names]
+            descriptor["collectionCounts"] = {
+                name: len(child)
+                for name, child in bounded_names
+                if isinstance(child, (list, dict))
+            }
+        elif isinstance(value, list):
+            descriptor["itemCount"] = len(value)
+        return descriptor
+
+    def _artifact_id(self, *, owner: str, environment: str, digest: str) -> str:
+        return _b64url(
+            hmac.new(
+                self.key.encode("utf-8"),
+                f"mutation-body:{owner}:{environment}:{digest}".encode("utf-8"),
+                hashlib.sha256,
+            ).digest()[:24]
+        )
+
+    def write(self, value: Any, *, owner: str, environment: str) -> dict[str, Any]:
+        content = serialized_bytes(value)
+        if len(content) > self.max_bytes:
+            raise ValueError(f"mutation body exceeds the {self.max_bytes}-byte artifact limit")
+        digest = hashlib.sha256(content).hexdigest()
+        artifact_id = self._artifact_id(owner=owner, environment=environment, digest=digest)
+        data_path, meta_path = self._paths(artifact_id)
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        if not data_path.exists():
+            self.prune()
+        expires_at = datetime.fromtimestamp(
+            int(time.time()) + self.ttl_seconds, timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        metadata = {
+            "contractVersion": 1,
+            "artifactKind": "proxyRequestBody",
+            "owner": owner,
+            "environment": environment,
+            "mediaType": "application/json",
+            "byteLength": len(content),
+            "sha256": digest,
+            "expiresAt": expires_at,
+            **self._shape(value),
+        }
+        ArtifactStore._atomic_write(data_path, content)
+        ArtifactStore._atomic_write(meta_path, serialized_bytes(metadata))
+        descriptor = self._descriptor(artifact_id, metadata)
+        if len(serialized_bytes(descriptor)) > PREVIEW_BUDGET_BYTES:
+            raise RuntimeError("mutation body descriptor exceeded its bounded size")
+        return descriptor
+
+    @staticmethod
+    def _descriptor(artifact_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        descriptor = {
+            "descriptorVersion": 1,
+            "contractVersion": 1,
+            "artifactKind": "proxyRequestBody",
+            "id": artifact_id,
+            "mediaType": metadata["mediaType"],
+            "byteLength": metadata["byteLength"],
+            "sha256": metadata["sha256"],
+            "expiresAt": metadata["expiresAt"],
+            "rootType": metadata["rootType"],
+            "immutable": True,
+            "rawReadable": False,
+            "queryable": False,
+            "usage": "Pass id as proxy_request.bodyArtifactId; do not also pass body.",
+        }
+        if metadata["rootType"] == "object":
+            descriptor["topLevelFields"] = metadata.get("topLevelFields", [])
+            descriptor["collectionCounts"] = metadata.get("collectionCounts", {})
+        elif metadata["rootType"] == "array":
+            descriptor["itemCount"] = metadata.get("itemCount", 0)
+        return descriptor
+
+    def _load_metadata(
+        self,
+        artifact_id: str,
+        *,
+        owner: str,
+        environment: str,
+    ) -> tuple[Path, dict[str, Any]]:
+        if not artifact_id or not all(char.isalnum() or char in "-_" for char in artifact_id):
+            raise ValueError("invalid mutation body artifact id")
+        data_path, meta_path = self._paths(artifact_id)
+        try:
+            metadata = json.loads(meta_path.read_text("utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            raise ValueError("mutation body artifact is unknown or was pruned; stage the body again") from exc
+        if metadata.get("contractVersion") != 1 or metadata.get("artifactKind") != "proxyRequestBody":
+            raise ValueError("mutation body artifact has an unsupported contract")
+        if metadata.get("owner") != owner or metadata.get("environment") != environment:
+            raise PermissionError("mutation body artifact belongs to a different caller or environment")
+        try:
+            expires_at = datetime.fromisoformat(str(metadata.get("expiresAt", "")).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("mutation body artifact metadata has an invalid expiry") from exc
+        if expires_at.timestamp() <= time.time():
+            data_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+            raise ValueError(f"mutation body artifact expired at {metadata.get('expiresAt')}; stage it again")
+        if not data_path.exists():
+            meta_path.unlink(missing_ok=True)
+            raise ValueError("mutation body artifact payload is missing; stage it again")
+        return data_path, metadata
+
+    def describe(self, artifact_id: str, *, owner: str, environment: str) -> dict[str, Any]:
+        _, metadata = self._load_metadata(artifact_id, owner=owner, environment=environment)
+        return self._descriptor(artifact_id, metadata)
+
+    def load(self, artifact_id: str, *, owner: str, environment: str) -> Any:
+        data_path, metadata = self._load_metadata(artifact_id, owner=owner, environment=environment)
+        content = data_path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        if len(content) != metadata.get("byteLength") or not hmac.compare_digest(
+            digest, str(metadata.get("sha256", ""))
+        ):
+            raise ValueError("mutation body artifact integrity check failed; stage it again")
+        expected_id = self._artifact_id(owner=owner, environment=environment, digest=digest)
+        if not hmac.compare_digest(expected_id, artifact_id):
+            raise ValueError("mutation body artifact identity check failed; stage it again")
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("mutation body artifact is not valid JSON; stage it again") from exc

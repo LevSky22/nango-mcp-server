@@ -74,9 +74,11 @@ def test_all_tool_schemas_are_strict_camel_case() -> None:
             "displayName", "email", "integrationsConfigDefaults", "oauthAppOwner",
         },
         "create_reconnect_session": {"environment", "connectionId", "providerConfigKey"},
+        "stage_proxy_request_body": {"environment", "body"},
         "proxy_request": {
             "environment", "providerConfigKey", "connectionId", "method", "path", "query", "headers",
-            "baseUrlOverride", "body", "responseMode", "responsePath", "fields", "filters", "pageSize", "cursor",
+            "baseUrlOverride", "body", "bodyArtifactId", "responseMode", "responsePath", "fields", "filters",
+            "pageSize", "cursor",
         },
         "query_response_artifact": {
             "environment", "artifactId", "responsePath", "fields", "filters", "pageSize", "cursor",
@@ -101,7 +103,7 @@ def test_all_tool_schemas_are_strict_camel_case() -> None:
         schema = tool.parameters
         assert schema["additionalProperties"] is False, name
         assert set(schema.get("properties", {})) == properties, name
-        if name in {"proxy_request", "query_response_artifact"}:
+        if name in {"proxy_request", "query_response_artifact", "stage_proxy_request_body"}:
             assert tool.output_schema is not None, name
 
         def assert_no_null_defaults(value: object) -> None:

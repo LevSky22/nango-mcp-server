@@ -148,7 +148,8 @@ Access tokens use these scopes:
 - `nango:env:<name>` or `nango:env:*`: environment access
 - `nango:read`: read intent
 - `nango:write`: mutation access
-- `nango:proxy`: proxy and download access
+- `nango:proxy` + `nango:read`: proxy GET/HEAD/OPTIONS and downloads
+- `nango:proxy` + `nango:write`: proxy mutations and request-body staging
 
 Issuer, resource, and introspection URLs must use HTTPS except for loopback development. The server validates activity, expiry, required scopes, and audience/resource.
 
@@ -158,7 +159,7 @@ Mutation tools use MCP-native approval flows. There are no confirmation-string a
 
 - `mutation_approval=server` asks for server-bound approval on every mutation.
 - `mutation_approval=host` delegates routine writes to host policy.
-- destructive actions always require server approval.
+- exact-target provider DELETE routes may be delegated to a trusted host; alphabetic collection routes, bulk/wildcard/template paths, query/body deletes, and ambiguous targets remain server-approved.
 - matching proxy routes can be forced back to server approval.
 
 Approval state is time-limited and bound to the caller policy, environment, tool, arguments, effect, and current target snapshot. Modern MCP clients receive `input_required`; compatible older sessions use elicitation.
@@ -197,11 +198,13 @@ Every tool uses strict camelCase wire names. Unknown arguments and legacy snake_
 
 ```text
 environment, providerConfigKey, connectionId, method, path,
-query, headers, baseUrlOverride, body, responseMode,
+query, headers, baseUrlOverride, body, bodyArtifactId, responseMode,
 responsePath, fields, filters, pageSize, cursor
 ```
 
 MCP-owned response fields include `contentType`, `responseHeaders`, `rateLimit`, and `responseMeta`. Provider JSON under `response` is preserved exactly.
+
+For mutation requests, inline bodies are limited to 4 KiB, 40 total collection entries, and JSON depth 8. If a body exceeds any limit, call `stage_proxy_request_body` with the same environment and body, then retry `proxy_request` with the returned `bodyArtifactId` and omit `body`. Staged bodies are immutable, expiring, digest-verified immediately before transmission, and have no raw-read or query interface.
 
 `query_response_artifact` accepts:
 
@@ -216,7 +219,7 @@ Rate-limit handling distinguishes Nango gateway throttles from forwarded provide
 
 ## Tools
 
-The server exposes 26 tools, grouped by workflow:
+The server exposes 27 tools, grouped by workflow:
 
 | Area | Tools | Access |
 | --- | --- | --- |
@@ -226,12 +229,12 @@ The server exposes 26 tools, grouped by workflow:
 | Connections | `list_connections`, `get_connection`, `get_connection_context`, `refresh_connection_credentials`, `import_connection`, `delete_connection` | Read/write |
 | Tags and metadata | `replace_connection_tags`, `update_connection_metadata` | Write |
 | Connect sessions | `create_connect_session`, `create_standard_connect_session`, `create_reconnect_session` | Write |
-| Provider API and large responses | `proxy_request`, `query_response_artifact` | Read/write |
+| Provider API and large responses | `stage_proxy_request_body`, `proxy_request`, `query_response_artifact` | Read/write |
 | Optional connection conventions | `describe_connection_convention`, `build_connection_convention`, `apply_connection_convention`, `audit_connection_conventions` | Read/write |
 
 See the [complete tool reference](https://github.com/LevSky22/nango-mcp-server/blob/main/docs/tools.md) for each tool's purpose, important inputs, result behavior, and safety notes. The MCP `tools/list` schema remains authoritative for exact input types and required fields.
 
-Management responses redact credential-like fields. `refresh_connection_credentials` returns only a non-secret summary. Non-GET/HEAD proxy requests and all other mutations follow the approval policy described above.
+Management responses redact credential-like fields. `refresh_connection_credentials` returns only a non-secret summary. Proxy methods other than GET/HEAD/OPTIONS and all other mutations follow the approval policy described above.
 
 The connection convention helpers are optional. They generate generic Nango tags and metadata; they are not profiles and do not discover organizations or impose deployment-specific policy.
 

@@ -9,6 +9,7 @@ from nango_mcp.response_safety import (
     HARD_RESULT_BUDGET_BYTES,
     INLINE_BUDGET_BYTES,
     ArtifactStore,
+    MutationBodyStore,
     bound_proxy_response,
     serialized_bytes,
 )
@@ -1005,3 +1006,63 @@ def test_v1_artifact_and_cursor_require_reminting(tmp_path) -> None:
             owner="operator", environment="sandbox", cursor_key="cursor-key", store=store,
             response_page_size=1, response_cursor=legacy,
         )
+
+
+def test_mutation_body_artifact_is_descriptor_only_and_scope_bound(tmp_path) -> None:
+    store = MutationBodyStore(str(tmp_path), "artifact-key", 3600, 1024 * 1024)
+    body = {"items": [{"text": "preserved"}, {"text": "updated"}], "notify": True}
+
+    descriptor = store.write(body, owner="operator", environment="sandbox")
+
+    assert descriptor["artifactKind"] == "proxyRequestBody"
+    assert descriptor["topLevelFields"] == ["items", "notify"]
+    assert descriptor["collectionCounts"] == {"items": 2}
+    assert descriptor["immutable"] is True
+    assert descriptor["rawReadable"] is False
+    assert descriptor["queryable"] is False
+    assert "preserved" not in json.dumps(descriptor)
+    assert store.load(descriptor["id"], owner="operator", environment="sandbox") == body
+    with pytest.raises(PermissionError, match="different caller or environment"):
+        store.load(descriptor["id"], owner="other", environment="sandbox")
+    with pytest.raises(PermissionError, match="different caller or environment"):
+        store.load(descriptor["id"], owner="operator", environment="other")
+
+
+def test_mutation_body_descriptor_stays_bounded_for_adversarial_field_names(tmp_path) -> None:
+    store = MutationBodyStore(str(tmp_path), "artifact-key", 3600, 1024 * 1024)
+    body = {f"field-{index}-{'x' * 500}": [index] for index in range(100)}
+
+    descriptor = store.write(body, owner="operator", environment="sandbox")
+
+    assert len(serialized_bytes(descriptor)) <= 8 * 1024
+    assert len(descriptor["topLevelFields"]) == 24
+    assert all(len(name) <= 120 for name in descriptor["topLevelFields"])
+
+
+def test_mutation_body_artifact_detects_content_and_metadata_substitution(tmp_path) -> None:
+    store = MutationBodyStore(str(tmp_path), "artifact-key", 3600, 1024 * 1024)
+    descriptor = store.write({"value": "original"}, owner="operator", environment="sandbox")
+    data_path, meta_path = store._paths(descriptor["id"])
+    data_path.write_text('{"value":"tampered"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="integrity check failed"):
+        store.load(descriptor["id"], owner="operator", environment="sandbox")
+
+    replacement = b'{"value":"replacement"}'
+    metadata = json.loads(meta_path.read_text("utf-8"))
+    metadata["byteLength"] = len(replacement)
+    metadata["sha256"] = hashlib.sha256(replacement).hexdigest()
+    data_path.write_bytes(replacement)
+    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with pytest.raises(ValueError, match="identity check failed"):
+        store.load(descriptor["id"], owner="operator", environment="sandbox")
+
+
+def test_mutation_body_artifact_expires_closed(tmp_path, monkeypatch) -> None:
+    now = 1_000_000.0
+    monkeypatch.setattr("nango_mcp.response_safety.time.time", lambda: now)
+    store = MutationBodyStore(str(tmp_path), "artifact-key", 60, 1024 * 1024)
+    descriptor = store.write({"value": 1}, owner="operator", environment="sandbox")
+    now += 61
+
+    with pytest.raises(ValueError, match="expired"):
+        store.load(descriptor["id"], owner="operator", environment="sandbox")

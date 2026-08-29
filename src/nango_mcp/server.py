@@ -61,7 +61,7 @@ from .conventions import (
 from .nango import NangoClient
 from .oauth import OAuthIntrospectionVerifier, caller_scope_from_access_token
 from .ratelimit import EnvironmentConcurrencyGate, current_environment
-from .response_safety import ArtifactStore, bound_proxy_response
+from .response_safety import ArtifactStore, MutationBodyStore, bound_proxy_response, serialized_bytes
 from .secrets import ResolvedNangoSecret, SecretResolver, build_secret_resolver
 
 
@@ -82,6 +82,26 @@ SECRET_KEY_FRAGMENTS = (
     "bearer",
     "token",
 )
+
+INLINE_MUTATION_BODY_MAX_BYTES = 4 * 1024
+INLINE_MUTATION_BODY_MAX_COLLECTION_ENTRIES = 40
+INLINE_MUTATION_BODY_MAX_DEPTH = 8
+
+PROXY_TOOL_META = {
+    "io.github.levsky22/operation-risk": {
+        "dynamic": True,
+        "methodArgument": "method",
+        "pathArgument": "path",
+        "readMethods": ["GET", "HEAD", "OPTIONS"],
+        "destructiveMethods": ["DELETE"],
+        "inlineBodyLimits": {
+            "maxSerializedBytes": INLINE_MUTATION_BODY_MAX_BYTES,
+            "maxCollectionEntries": INLINE_MUTATION_BODY_MAX_COLLECTION_ENTRIES,
+            "maxDepth": INLINE_MUTATION_BODY_MAX_DEPTH,
+        },
+        "bodyStagingTool": "stage_proxy_request_body",
+    }
+}
 
 OAUTH_AUTH_MODES = {"OAUTH1", "OAUTH2", "OAUTH2_CC"}
 CREDENTIAL_AUTH_MODES = {"API_KEY", "BASIC", "JWT", "SIGNATURE", "APP", "APP_STORE", "CUSTOM", "TWO_STEP"}
@@ -179,6 +199,27 @@ class ProxyRequestResult(BaseModel):
     responseMeta: dict[str, Any] | None = None
 
 
+class MutationBodyArtifactResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    descriptorVersion: Literal[1]
+    contractVersion: Literal[1]
+    artifactKind: Literal["proxyRequestBody"]
+    id: str
+    mediaType: Literal["application/json"]
+    byteLength: int = Field(ge=0)
+    sha256: str
+    expiresAt: str
+    rootType: str
+    topLevelFields: list[str] | None = None
+    collectionCounts: dict[str, int] | None = None
+    itemCount: int | None = None
+    immutable: Literal[True]
+    rawReadable: Literal[False]
+    queryable: Literal[False]
+    usage: str
+
+
 def _request_state_principal(_: ServerRequestContext[Any, Any]) -> str:
     caller = require_scope()
     policy = {
@@ -191,7 +232,7 @@ def _request_state_principal(_: ServerRequestContext[Any, Any]) -> str:
 
 
 class ToolPolicyMiddleware:
-    """Enforce caller tool denials before argument validation or handler execution."""
+    """Enforce name-only denials before argument-aware policy runs in the handler."""
 
     async def __call__(self, ctx: ServerRequestContext[Any, Any], call_next: Any) -> Any:
         if ctx.method == "tools/call":
@@ -199,8 +240,8 @@ class ToolPolicyMiddleware:
             name = getattr(params, "name", None)
             if name is None and isinstance(params, dict):
                 name = params.get("name")
-            if isinstance(name, str):
-                authorize_operation(require_scope(), name)
+            if isinstance(name, str) and name in require_scope().denied_tools:
+                raise PermissionError(f"caller policy denies tool {name!r}")
         return await call_next(ctx)
 
 
@@ -500,11 +541,61 @@ MUTATION_EFFECTS = {
     "apply_connection_convention": "low",
 }
 
+_READ_PROXY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_BROAD_DELETE_PATH_SEGMENTS = frozenset(
+    {"all", "batch", "bulk", "clear", "many", "purge", "truncate", "wildcard"}
+)
+_UUID_PATH_SEGMENT = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+    re.I,
+)
+_OPAQUE_ID_PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~-]*")
+
 
 def _mutation_effect(tool: str, args: tuple[Any, ...]) -> str:
     if tool == "proxy_request":
         return "destructive" if len(args) > 2 and str(args[2]).upper() == "DELETE" else "elevated"
     return MUTATION_EFFECTS[tool]
+
+
+def _is_exact_target_proxy_delete(args: tuple[Any, ...]) -> bool:
+    """Conservatively recognize DELETE routes that identify one resource in-path."""
+    if len(args) < 4 or str(args[2]).strip().upper() != "DELETE":
+        return False
+    path = str(args[3]).strip()
+    query = args[4] if len(args) > 4 else None
+    body = args[7] if len(args) > 7 else None
+    body_artifact_id = args[8] if len(args) > 8 else None
+    if query or body is not None or body_artifact_id is not None:
+        return False
+    if any(marker in path for marker in ("*", "{", "}", ":", "?")):
+        return False
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) < 2 or any(segment.lower() in _BROAD_DELETE_PATH_SEGMENTS for segment in segments):
+        return False
+    target = segments[-1]
+    if not _OPAQUE_ID_PATH_SEGMENT.fullmatch(target):
+        return False
+    if target.isdigit() or _UUID_PATH_SEGMENT.fullmatch(target):
+        return True
+    # Alphabetic collection nouns never qualify solely because they are long.
+    return len(target) >= 4 and any(character.isdigit() for character in target)
+
+
+def _requires_server_mutation_approval(tool: str, args: tuple[Any, ...]) -> bool:
+    caller = require_scope()
+    if caller.mutation_approval != "host":
+        return True
+    if tool != "proxy_request":
+        return _mutation_effect(tool, args) == "destructive"
+    if _mutation_effect(tool, args) == "destructive" and not _is_exact_target_proxy_delete(args):
+        return True
+    return proxy_route_matches(
+        caller.server_approval_proxy_path_patterns,
+        provider_config_key=str(args[0]) if len(args) > 0 else "",
+        method=str(args[2]) if len(args) > 2 else "",
+        path=str(args[3]) if len(args) > 3 else "",
+    )
 
 
 class MutationApprovalError(PermissionError):
@@ -536,6 +627,19 @@ def _approval_message(tool: str, environment: str, args: tuple[Any, ...]) -> str
         target = f" connection={args[0]} integration={args[1]}"
     elif tool == "proxy_request" and len(args) >= 4:
         target = f" method={str(args[2]).upper()} path={args[3]} integration={args[0]} connection={args[1]}"
+        if len(args) > 8 and args[8]:
+            caller = require_scope()
+            descriptor = _mutation_body_store(_runtime()[0]).describe(
+                str(args[8]), owner=caller.label, environment=environment
+            )
+            target += (
+                f" bodyArtifactId={descriptor['id']} immutable=true"
+                f" bodyBytes={descriptor['byteLength']}"
+                f" bodySha256={str(descriptor['sha256'])[:16]}"
+                f" bodyRootType={descriptor['rootType']}"
+                f" bodyFields={descriptor.get('topLevelFields', [])}"
+                f" bodyCollectionCounts={descriptor.get('collectionCounts', {})}"
+            )
     return (
         f"Approve Nango mutation: effect={_mutation_effect(tool, args)} "
         f"environment={environment} tool={tool}{target}"
@@ -606,14 +710,8 @@ async def _authorize_mutation(
     _assert_writable()
     caller = require_scope()
     authorize_operation(caller, tool)
-    if caller.mutation_approval == "host" and _mutation_effect(tool, args) != "destructive":
-        if tool != "proxy_request" or not proxy_route_matches(
-            caller.server_approval_proxy_path_patterns,
-            provider_config_key=str(args[0]),
-            method=str(args[2]),
-            path=str(args[3]),
-        ):
-            return None
+    if not _requires_server_mutation_approval(tool, args):
+        return None
     snapshot = await _target_snapshot(tool, environment, args)
     if ctx.protocol_version not in MODERN_PROTOCOL_VERSIONS:
         session = ctx.request_context.session
@@ -1208,6 +1306,59 @@ def _artifact_store(settings: Settings) -> ArtifactStore:
     )
 
 
+def _mutation_body_store(settings: Settings) -> MutationBodyStore:
+    root = settings.artifact_root
+    if not root:
+        uid = getattr(os, "getuid", lambda: 0)()
+        root = str(Path(tempfile.gettempdir()) / f"nango-mcp-{uid}" / "artifacts")
+    key = settings.request_state_keys[0] if settings.request_state_keys else _state_keys[0]
+    return MutationBodyStore(
+        root,
+        key,
+        settings.artifact_ttl_seconds,
+        settings.artifact_max_bytes,
+    )
+
+
+def _mutation_body_shape(value: Any) -> tuple[int, int]:
+    collection_entries = 0
+    max_depth = 1
+    pending = [(value, 1)]
+    while pending:
+        current, depth = pending.pop()
+        max_depth = max(max_depth, depth)
+        if isinstance(current, dict):
+            collection_entries += len(current)
+            pending.extend((child, depth + 1) for child in current.values())
+        elif isinstance(current, list):
+            collection_entries += len(current)
+            pending.extend((child, depth + 1) for child in current)
+    return collection_entries, max_depth
+
+
+def _require_safe_inline_mutation_body(method: str, body: Any | None) -> None:
+    if body is None or method.upper() in _READ_PROXY_METHODS:
+        return
+    byte_length = len(serialized_bytes(body))
+    collection_entries, max_depth = _mutation_body_shape(body)
+    exceeded: list[str] = []
+    if byte_length > INLINE_MUTATION_BODY_MAX_BYTES:
+        exceeded.append(f"serializedBytes={byte_length}>{INLINE_MUTATION_BODY_MAX_BYTES}")
+    if collection_entries > INLINE_MUTATION_BODY_MAX_COLLECTION_ENTRIES:
+        exceeded.append(
+            f"collectionEntries={collection_entries}>{INLINE_MUTATION_BODY_MAX_COLLECTION_ENTRIES}"
+        )
+    if max_depth > INLINE_MUTATION_BODY_MAX_DEPTH:
+        exceeded.append(f"depth={max_depth}>{INLINE_MUTATION_BODY_MAX_DEPTH}")
+    if exceeded:
+        raise ValueError(
+            "INLINE_BODY_REQUIRES_STAGING: "
+            + ", ".join(exceeded)
+            + ". Call stage_proxy_request_body with the same environment and body, then retry "
+            "proxy_request with its bodyArtifactId and omit body."
+        )
+
+
 def _binary_store(settings: Settings) -> BinaryResourceStore:
     root = settings.artifact_root
     if not root:
@@ -1297,6 +1448,23 @@ def _response_control_error_result(
 
 
 @mcp.tool(structured_output=True)
+async def stage_proxy_request_body(
+    environment: str,
+    body: Any,
+) -> Annotated[CallToolResult, MutationBodyArtifactResult]:
+    """Stage an immutable outbound JSON body and return only its bounded descriptor."""
+    settings, _, _ = await _resolve(environment)
+    caller = require_scope()
+    store = _mutation_body_store(settings)
+    store.prune()
+    descriptor = store.write(body, owner=caller.label, environment=environment)
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(descriptor, separators=(",", ":")))],
+        structuredContent=descriptor,
+    )
+
+
+@mcp.tool(meta=PROXY_TOOL_META, structured_output=True)
 async def proxy_request(
     ctx: Context,
     environment: str,
@@ -1308,6 +1476,7 @@ async def proxy_request(
     headers: dict[str, str] | None = None,
     baseUrlOverride: str | None = None,
     body: Any | None = None,
+    bodyArtifactId: str | None = None,
     responseMode: str = "auto",
     responsePath: str | None = None,
     fields: list[str] | None = None,
@@ -1317,6 +1486,15 @@ async def proxy_request(
 ) -> Annotated[CallToolResult, ProxyRequestResult]:
     """Call a provider API through the Nango Proxy without exposing provider tokens."""
     normalized_method = method.strip().upper()
+    if body is not None and bodyArtifactId is not None:
+        return _response_control_error_result(
+            ValueError("body and bodyArtifactId are mutually exclusive"),
+            tool="proxy_request",
+        )
+    try:
+        _require_safe_inline_mutation_body(normalized_method, body)
+    except ValueError as error:
+        return _response_control_error_result(error, tool="proxy_request")
     caller = require_scope()
     authorize_operation(
         caller,
@@ -1325,17 +1503,38 @@ async def proxy_request(
         method=normalized_method,
         path=path,
     )
+    if bodyArtifactId is not None:
+        try:
+            _mutation_body_store(_runtime()[0]).describe(
+                bodyArtifactId,
+                owner=caller.label,
+                environment=environment,
+            )
+        except (ValueError, PermissionError) as error:
+            return _response_control_error_result(ValueError(str(error)), tool="proxy_request")
     mutation_args = (
         providerConfigKey, connectionId, normalized_method, path, query, headers,
-        baseUrlOverride, body,
+        baseUrlOverride, body, bodyArtifactId,
     )
-    if normalized_method not in {"GET", "HEAD"}:
+    if normalized_method not in _READ_PROXY_METHODS:
         approval = await _authorize_mutation(ctx, "proxy_request", environment, mutation_args)
         if approval:
             return approval
     if responseMode not in {"auto", "inline", "artifact"}:
-        raise ValueError("responseMode must be auto, inline, or artifact")
+        return _response_control_error_result(
+            ValueError("responseMode must be auto, inline, or artifact"),
+            tool="proxy_request",
+        )
     settings, nango, secret = await _resolve(environment)
+    if bodyArtifactId is not None:
+        try:
+            body = _mutation_body_store(settings).load(
+                bodyArtifactId,
+                owner=caller.label,
+                environment=environment,
+            )
+        except ValueError as error:
+            return _response_control_error_result(error, tool="proxy_request")
     environment_token = current_environment.set(environment)
     try:
         gate = _environment_gate or EnvironmentConcurrencyGate(4, 30.0)
@@ -1704,6 +1903,7 @@ _enforce_strict_tool_arguments(
     "list_connections",
     "get_connection",
     "get_connection_context",
+    "stage_proxy_request_body",
     "proxy_request",
     "query_response_artifact",
     "download_provider_file",
