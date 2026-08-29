@@ -77,15 +77,15 @@ async def test_get_integration_includes_credentials_with_current_nango_query_sha
 
 
 @pytest.mark.asyncio
-async def test_set_connection_metadata_uses_documented_body_shape() -> None:
+async def test_update_connection_metadata_uses_documented_body_shape() -> None:
     client = CapturingNangoClient()
 
-    await client.set_connection_metadata(
+    await client.update_connection_metadata(
         "nango-secret",
         "prod__microsoft__service",
         "microsoft",
         {"nango_mcp": {"purpose": "mailbox_readwrite"}},
-        patch=True,
+        mode="merge",
     )
 
     assert client.calls == [

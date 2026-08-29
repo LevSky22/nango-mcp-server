@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 import nango_mcp.server as server
 from nango_mcp.auth import CallerScope, reset_scope, set_scope
@@ -38,25 +39,91 @@ def test_as_data_list_accepts_wrapped_or_raw_lists() -> None:
     assert _as_data_list({"data": {"name": "github"}}) == []
 
 
-def test_proxy_schema_is_strict_camel_case() -> None:
-    tool = server.mcp._tool_manager.get_tool("proxy_request")
-    assert tool.parameters["additionalProperties"] is False
-    properties = tool.parameters["properties"]
-    assert "providerConfigKey" in properties
-    assert "connectionId" in properties
-    assert "baseUrlOverride" in properties
-    assert "provider_config_key" not in properties
+def test_all_tool_schemas_are_strict_camel_case() -> None:
+    expected = {
+        "describe_connection_convention": set(),
+        "list_environments": {"refresh"},
+        "check_environment": {"environment", "refresh"},
+        "list_integrations": {"environment", "refreshSecret"},
+        "get_integration": {"environment", "integrationId", "includeCredentials"},
+        "search_provider_templates": {"environment", "query", "limit", "includeRawTemplates"},
+        "create_integration": {"environment", "payload"},
+        "update_integration": {
+            "environment", "integrationId", "fields", "reconnectConnectionIds",
+            "autoReconnectSingleMatchingConnection",
+        },
+        "delete_integration": {"environment", "integrationId"},
+        "list_connections": {
+            "environment", "connectionId", "integrationId", "search", "endUserId",
+            "endUserOrganizationId", "limit",
+        },
+        "get_connection": {"environment", "connectionId", "providerConfigKey", "includeCredentials"},
+        "refresh_connection_credentials": {"environment", "connectionId", "providerConfigKey"},
+        "get_connection_context": {
+            "environment", "connectionId", "providerConfigKey", "includeRawProviderTemplate",
+        },
+        "import_connection": {"environment", "payload"},
+        "delete_connection": {"environment", "connectionId", "providerConfigKey"},
+        "replace_connection_tags": {"environment", "connectionId", "providerConfigKey", "tags"},
+        "update_connection_metadata": {
+            "environment", "connectionId", "providerConfigKey", "metadata", "mode",
+        },
+        "create_connect_session": {"environment", "allowedIntegrations", "tags", "integrationsConfigDefaults"},
+        "create_standard_connect_session": {
+            "environment", "providerConfigKey", "principal", "ownerKind", "purpose", "organizationId",
+            "displayName", "email", "integrationsConfigDefaults", "oauthAppOwner",
+        },
+        "create_reconnect_session": {"environment", "connectionId", "providerConfigKey"},
+        "proxy_request": {
+            "environment", "providerConfigKey", "connectionId", "method", "path", "query", "headers",
+            "baseUrlOverride", "body", "responseMode", "responsePath", "fields", "filters", "pageSize", "cursor",
+        },
+        "query_response_artifact": {
+            "environment", "artifactId", "responsePath", "fields", "filters", "pageSize", "cursor",
+            "describe", "objectMode", "textSearch",
+        },
+        "download_provider_file": {
+            "environment", "providerConfigKey", "connectionId", "path", "query", "headers",
+            "baseUrlOverride", "suggestedName",
+        },
+        "build_connection_convention": {
+            "environment", "providerConfigKey", "principal", "ownerKind", "purpose", "oauthAppOwner",
+        },
+        "apply_connection_convention": {
+            "environment", "connectionId", "providerConfigKey", "principal", "ownerKind", "purpose",
+            "oauthAppOwner", "patchMetadata",
+        },
+        "audit_connection_conventions": {"environment", "limit"},
+    }
+    assert set(server.mcp._tool_manager._tools) == set(expected)  # type: ignore[attr-defined]
+    for name, properties in expected.items():
+        schema = server.mcp._tool_manager.get_tool(name).parameters
+        assert schema["additionalProperties"] is False, name
+        assert set(schema.get("properties", {})) == properties, name
 
-    query_tool = server.mcp._tool_manager.get_tool("query_response_artifact")
-    assert query_tool.parameters["additionalProperties"] is False
-    query_properties = query_tool.parameters["properties"]
-    assert {"artifactId", "responsePath", "pageSize", "objectMode", "textSearch"} <= set(query_properties)
-    assert "artifact_id" not in query_properties
+        def assert_no_null_defaults(value: object) -> None:
+            if isinstance(value, dict):
+                assert value.get("default", "missing") is not None, name
+                for child in value.values():
+                    assert_no_null_defaults(child)
+            elif isinstance(value, list):
+                for child in value:
+                    assert_no_null_defaults(child)
 
-    download_tool = server.mcp._tool_manager.get_tool("download_provider_file")
-    assert download_tool.parameters["additionalProperties"] is False
-    download_properties = download_tool.parameters["properties"]
-    assert {"providerConfigKey", "connectionId", "baseUrlOverride", "suggestedName"} <= set(download_properties)
+        assert_no_null_defaults(schema)
+
+
+@pytest.mark.asyncio
+async def test_management_tool_rejects_legacy_snake_case_before_execution() -> None:
+    with pytest.raises(ToolError, match="connection_id"):
+        await server.mcp.call_tool(
+            "get_connection",
+            {
+                "environment": "sandbox",
+                "connection_id": "sample-connection",
+                "provider_config_key": "sample-integration",
+            },
+        )
 
 
 @pytest.mark.asyncio
