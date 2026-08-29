@@ -9,12 +9,14 @@ import hashlib
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Iterable, Literal
 
 import uvicorn
 from mcp.server import MCPServer
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.context import ServerRequestContext
+from mcp.server.lowlevel.helper_types import ReadResourceContents
+from mcp.server.mcpserver.exceptions import ResourceError
 from mcp.server.mcpserver import Context
 from mcp.server.request_state import RequestStateBoundary, RequestStateSecurity
 from mcp.server.transport_security import TransportSecuritySettings
@@ -28,7 +30,7 @@ from mcp_types import (
     TextContent,
 )
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -105,6 +107,78 @@ _state_keys = [
 ] or [secrets.token_urlsafe(32)]
 
 
+class PublicNangoMCPServer(MCPServer):
+    """Return bounded JSON artifact descriptors without advertising a raw template."""
+
+    async def read_resource(
+        self,
+        uri: Any,
+        context: Context | None = None,
+    ) -> Iterable[ReadResourceContents] | InputRequiredResult:
+        uri_text = str(uri)
+        prefix = "nango-mcp://artifact/"
+        if not uri_text.startswith(prefix):
+            return await super().read_resource(uri, context)
+        artifact_id = uri_text.removeprefix(prefix)
+        try:
+            settings, _, _ = _runtime()
+            caller = require_scope()
+            configured = frozenset(item.slug for item in settings.environments)
+            descriptor = _artifact_store(settings).describe_authorized(
+                artifact_id,
+                owner=caller.label,
+                environments=permitted_environments(configured, caller),
+            )
+        except Exception as exc:
+            raise ResourceError("response artifact descriptor is unavailable") from exc
+        content = json.dumps(descriptor, ensure_ascii=False, separators=(",", ":"))
+        if len(content.encode("utf-8")) > 8 * 1024:
+            raise ResourceError("response artifact descriptor exceeds its bounded size")
+        return [ReadResourceContents(content=content, mime_type="application/json")]
+
+
+class ArtifactQueryResponseMeta(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contractVersion: Literal[2]
+    truncated: bool
+    complete: bool
+    truncationReason: str | None
+    returnedCount: int | None
+    totalCount: int | None
+    remainingCount: int | None
+    nextCursor: str | None
+    serializedBytes: int = Field(ge=0)
+    warning: str | None = None
+    pageUnit: Literal["items", "entries"] | None = None
+    sourceTruncated: bool | None = None
+    filtersApplied: list[dict[str, Any]] | None = None
+    fieldsResolved: dict[str, int] | None = None
+    inferredResponsePath: str | None = None
+
+
+class ArtifactQueryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifactId: str
+    responsePath: str
+    response: Any | None = None
+    shape: dict[str, Any] | None = None
+    responseMeta: ArtifactQueryResponseMeta
+
+
+class ProxyRequestResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool | None
+    status: int | None
+    contentType: str | None
+    responseHeaders: dict[str, Any]
+    response: Any | None
+    rateLimit: dict[str, Any] | None = None
+    responseMeta: dict[str, Any] | None = None
+
+
 def _request_state_principal(_: ServerRequestContext[Any, Any]) -> str:
     caller = require_scope()
     policy = {
@@ -130,7 +204,7 @@ class ToolPolicyMiddleware:
         return await call_next(ctx)
 
 
-mcp = MCPServer(
+mcp = PublicNangoMCPServer(
     name="Nango MCP Server",
     version="1.0.0",
     instructions=(
@@ -1107,6 +1181,7 @@ def _camelize_owned_envelope(value: dict[str, Any]) -> dict[str, Any]:
         "content_type": "contentType",
         "response_headers": "responseHeaders",
         "rate_limit": "rateLimit",
+        "response_warning": "responseWarning",
     }
     result = {mapping.get(key, key): child for key, child in value.items()}
     rate_limit = result.get("rateLimit")
@@ -1153,8 +1228,10 @@ def _artifact_tool_result(result: dict[str, Any]) -> CallToolResult:
                 name=f"Nango response {artifact['id']}",
                 uri=artifact["uri"],
                 mimeType=artifact["mediaType"],
-                size=artifact["byteLength"],
-                description="Complete immutable provider response envelope",
+                description=(
+                    "Bounded artifact descriptor only; use query_response_artifact "
+                    "to inspect stored provider values."
+                ),
             )
         )
     return CallToolResult(
@@ -1163,7 +1240,63 @@ def _artifact_tool_result(result: dict[str, Any]) -> CallToolResult:
     )
 
 
-@mcp.tool(structured_output=False)
+def _response_control_error_code(error: ValueError) -> str:
+    match = re.match(r"^([A-Z][A-Z0-9_]+):", str(error))
+    return match.group(1) if match else "INVALID_RESPONSE_CONTROLS"
+
+
+def _response_control_error_result(
+    error: ValueError,
+    *,
+    tool: str,
+    artifact_id: str | None = None,
+    response_path: str | None = None,
+    provider_response: dict[str, Any] | None = None,
+) -> CallToolResult:
+    """Return a bounded, structured control error rather than an opaque SDK error."""
+    message = str(error)
+    error_value = {"error": {"code": _response_control_error_code(error), "message": message}}
+    if tool == "proxy_request":
+        provider_response = provider_response or {}
+        structured = {
+            "ok": provider_response.get("ok", False),
+            "status": provider_response.get("status"),
+            "contentType": provider_response.get("contentType"),
+            "responseHeaders": provider_response.get("responseHeaders", {}),
+            "response": error_value,
+            "rateLimit": None,
+            "responseMeta": None,
+        }
+    else:
+        structured = {
+            "artifactId": artifact_id or "unknown",
+            "responsePath": response_path if response_path is not None else "/response",
+            "response": error_value,
+            "shape": None,
+            "responseMeta": {
+                "contractVersion": 2,
+                "truncated": False,
+                "complete": False,
+                "truncationReason": None,
+                "returnedCount": 0,
+                "totalCount": None,
+                "remainingCount": None,
+                "nextCursor": None,
+                "serializedBytes": 0,
+                "warning": message,
+            },
+        }
+        structured["responseMeta"]["serializedBytes"] = len(
+            json.dumps(structured, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+    return CallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=message)],
+        structuredContent=structured,
+    )
+
+
+@mcp.tool(structured_output=True)
 async def proxy_request(
     ctx: Context,
     environment: str,
@@ -1181,7 +1314,7 @@ async def proxy_request(
     filters: list[dict[str, Any]] | None = None,
     pageSize: int = 20,
     cursor: str | None = None,
-) -> Any:
+) -> Annotated[CallToolResult, ProxyRequestResult]:
     """Call a provider API through the Nango Proxy without exposing provider tokens."""
     normalized_method = method.strip().upper()
     caller = require_scope()
@@ -1221,46 +1354,58 @@ async def proxy_request(
     finally:
         current_environment.reset(environment_token)
     public_response = _camelize_owned_envelope(response)
+    response_warning = public_response.pop("responseWarning", None)
     if public_response.get("rateLimit") is not None:
         return _artifact_tool_result(public_response)
     caller = require_scope()
     key = settings.request_state_keys[0] if settings.request_state_keys else _state_keys[0]
-    bounded = bound_proxy_response(
-        public_response,
-        owner=caller.label,
-        environment=environment,
-        cursor_key=key,
-        store=_artifact_store(settings),
-        response_mode="full" if responseMode == "inline" else responseMode,
-        response_path=responsePath,
-        fields=fields,
-        response_filter=filters,
-        response_page_size=pageSize,
-        response_cursor=cursor,
-    )
-    return _artifact_tool_result(bounded)
+    try:
+        status = public_response.get("status")
+        provider_failed = public_response.get("ok") is False or (
+            isinstance(status, int) and status >= 400
+        )
+        if provider_failed:
+            warning = (
+                f"Provider returned HTTP {status}; responsePath, fields, filters, and cursor "
+                "were not applied so the upstream failure remains visible."
+            )
+            if response_warning:
+                warning = f"{response_warning} {warning}"
+            bounded = bound_proxy_response(
+                public_response,
+                owner=caller.label,
+                environment=environment,
+                cursor_key=key,
+                store=_artifact_store(settings),
+                response_mode="full" if responseMode == "inline" else responseMode,
+                response_page_size=pageSize,
+                response_warning=warning,
+            )
+        else:
+            bounded = bound_proxy_response(
+                public_response,
+                owner=caller.label,
+                environment=environment,
+                cursor_key=key,
+                store=_artifact_store(settings),
+                response_mode="full" if responseMode == "inline" else responseMode,
+                response_path=responsePath,
+                fields=fields,
+                response_filter=filters,
+                response_page_size=pageSize,
+                response_cursor=cursor,
+                response_warning=response_warning,
+            )
+        return _artifact_tool_result(bounded)
+    except ValueError as error:
+        return _response_control_error_result(
+            error,
+            tool="proxy_request",
+            provider_response=public_response,
+        )
 
 
-@mcp.resource(
-    "nango-mcp://artifact/{artifactId}",
-    name="Nango response artifact",
-    description="Authenticated complete provider response envelope",
-    mime_type="application/json",
-)
-def read_response_artifact(artifactId: str) -> str:
-    settings, _, _ = _runtime()
-    caller = require_scope()
-    configured = frozenset(item.slug for item in settings.environments)
-    permitted = permitted_environments(configured, caller)
-    content, _ = _artifact_store(settings).read_authorized(
-        artifactId,
-        owner=caller.label,
-        environments=permitted,
-    )
-    return content.decode("utf-8")
-
-
-@mcp.tool(structured_output=False)
+@mcp.tool(structured_output=True)
 async def query_response_artifact(
     environment: str,
     artifactId: str,
@@ -1272,25 +1417,33 @@ async def query_response_artifact(
     describe: bool = False,
     objectMode: Literal["entries"] | None = None,
     textSearch: dict[str, Any] | None = None,
-) -> CallToolResult:
+) -> Annotated[CallToolResult, ArtifactQueryResult]:
     """Query a stored provider response with bounded, strict camelCase controls."""
     settings, _, _ = await _resolve(environment)
     caller = require_scope()
     store = _artifact_store(settings)
     store.prune()
-    result = store.query(
-        artifactId,
-        owner=caller.label,
-        environment=environment,
-        response_path=responsePath,
-        fields=fields,
-        response_filter=filters,
-        response_page_size=pageSize,
-        cursor=cursor,
-        describe=describe,
-        object_mode=objectMode,
-        text_search=textSearch,
-    )
+    try:
+        result = store.query(
+            artifactId,
+            owner=caller.label,
+            environment=environment,
+            response_path=responsePath,
+            fields=fields,
+            response_filter=filters,
+            response_page_size=pageSize,
+            cursor=cursor,
+            describe=describe,
+            object_mode=objectMode,
+            text_search=textSearch,
+        )
+    except ValueError as error:
+        return _response_control_error_result(
+            error,
+            tool="query_response_artifact",
+            artifact_id=artifactId,
+            response_path=responsePath,
+        )
     return CallToolResult(
         content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, separators=(",", ":")))],
         structuredContent=result,

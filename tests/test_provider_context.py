@@ -97,9 +97,12 @@ def test_all_tool_schemas_are_strict_camel_case() -> None:
     }
     assert set(server.mcp._tool_manager._tools) == set(expected)  # type: ignore[attr-defined]
     for name, properties in expected.items():
-        schema = server.mcp._tool_manager.get_tool(name).parameters
+        tool = server.mcp._tool_manager.get_tool(name)
+        schema = tool.parameters
         assert schema["additionalProperties"] is False, name
         assert set(schema.get("properties", {})) == properties, name
+        if name in {"proxy_request", "query_response_artifact"}:
+            assert tool.output_schema is not None, name
 
         def assert_no_null_defaults(value: object) -> None:
             if isinstance(value, dict):
@@ -180,3 +183,70 @@ async def test_proxy_request_returns_provider_payload_as_json_text(monkeypatch: 
         assert calls[1]["kwargs"]["base_url_override"] == "https://graph.microsoft.com"
     finally:
         reset_scope(scope_token)
+
+
+@pytest.mark.asyncio
+async def test_proxy_provider_error_precedes_invalid_response_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeNango:
+        async def proxy_request(self, *_args, **_kwargs):
+            return {
+                "ok": False,
+                "status": 404,
+                "content_type": "application/json",
+                "response_headers": {"x-request-id": "request-123"},
+                "response": {"error": {"message": "Not found"}},
+            }
+
+    async def fake_resolve(environment: str):
+        settings = SimpleNamespace(
+            request_state_keys=(), artifact_root="", artifact_ttl_seconds=86400,
+            artifact_max_bytes=50 * 1024 * 1024,
+        )
+        return settings, FakeNango(), SimpleNamespace(environment=environment, nango_secret_key="fake-secret")
+
+    monkeypatch.setattr(server, "_resolve", fake_resolve)
+    scope_token = set_scope(CallerScope("test", frozenset({"sandbox"})))
+    try:
+        result = await server.proxy_request(
+            None, "sandbox", "sample-integration", "sample-connection", "GET", "/items",
+            responsePath="/doesNotExist", fields=["id"],
+        )
+    finally:
+        reset_scope(scope_token)
+
+    structured = result.structured_content
+    assert structured["ok"] is False
+    assert structured["status"] == 404
+    assert structured["response"] == {"error": {"message": "Not found"}}
+    assert "were not applied" in structured["responseMeta"]["warning"]
+
+
+@pytest.mark.asyncio
+async def test_json_artifact_resource_is_descriptor_only_and_not_advertised(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    store = server.ArtifactStore(str(tmp_path), "nango-mcp://artifact", "cursor-key", 3600, 1024 * 1024)
+    artifact = store.write(
+        {"ok": True, "response": {"secretValue": "stored-only"}},
+        owner="test",
+        environment="sandbox",
+    )
+    settings = SimpleNamespace(environments=[SimpleNamespace(slug="sandbox")])
+    monkeypatch.setattr(server, "_runtime", lambda: (settings, None, None))
+    monkeypatch.setattr(server, "_artifact_store", lambda _settings: store)
+
+    scope_token = set_scope(CallerScope("test", frozenset({"sandbox"})))
+    try:
+        contents = await server.mcp.read_resource(artifact["uri"])
+        templates = await server.mcp.list_resource_templates()
+    finally:
+        reset_scope(scope_token)
+
+    descriptor = json.loads(list(contents)[0].content)
+    template_uris = {str(item.uri_template) for item in templates}
+    assert descriptor["rawReadable"] is False
+    assert descriptor["queryTool"] == "query_response_artifact"
+    assert "stored-only" not in json.dumps(descriptor)
+    assert "nango-mcp://artifact/{artifactId}" not in template_uris
+    assert "nango-mcp://download/{resourceId}" in template_uris

@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import hmac
 import json
 
 import pytest
@@ -106,7 +109,8 @@ def test_artifact_descriptor_and_scoped_delete(tmp_path) -> None:
 
     descriptor = store.describe(artifact["id"], owner="operator", environment="sandbox")
     assert descriptor["descriptorVersion"] == 1
-    assert descriptor["rawReadable"] is True
+    assert descriptor["contractVersion"] == 2
+    assert descriptor["rawReadable"] is False
     assert artifact["uri"] == f"nango-mcp://artifact/{artifact['id']}"
     content, metadata = store.read_authorized(
         artifact["id"],
@@ -626,39 +630,38 @@ def test_filter_requires_path_and_rejects_legacy_field_key(tmp_path) -> None:
 def test_filter_icontains_is_case_insensitive(tmp_path) -> None:
     store = ArtifactStore(str(tmp_path), "/downloads", "cursor-key", 3600, 1024 * 1024)
     result = bound_proxy_response(
-        _envelope([{"subject": "Toronto Piano Move"}, {"subject": "Storage quote"}]),
+        _envelope([{"subject": "Example Project"}, {"subject": "Storage quote"}]),
         owner="operator",
         environment="sandbox",
         cursor_key="cursor-key",
         store=store,
-        response_filter=[{"path": "/subject", "op": "icontains", "value": "pIaNo"}],
+        response_filter=[{"path": "/subject", "op": "icontains", "value": "pRoJeCt"}],
     )
 
-    assert result["response"] == [{"subject": "Toronto Piano Move"}]
+    assert result["response"] == [{"subject": "Example Project"}]
 
 
 def _store(tmp_path):
     return ArtifactStore(str(tmp_path), "/downloads", "cursor-key", 3600, 8 * 1024 * 1024)
 
 
-# The Harmony runtime logged 38 pointer failures in four days, every one a provider key
-# used at the artifact root instead of under /response. describe and primary_paths exist to
-# make that mistake self-correcting rather than a guess.
-_CLICKUP_LIKE = {
-    "id": "86b1abcde",
-    "name": "Marie Tremblay",
+# Provider-relative pointers are a generic usability hazard when callers omit /response.
+# Shape descriptions and primary paths make that mistake self-correcting rather than a guess.
+_SAMPLE_RECORD = {
+    "id": "sample-record",
+    "name": "Example Person",
     "custom_fields": [
         {"id": "cf1", "name": "Service date", "value": "2026-09-12"},
-        {"id": "cf2", "name": "Origin", "value": "Montreal"},
+        {"id": "cf2", "name": "Origin", "value": "Example City"},
     ],
-    "status": {"status": "nouveaux leads", "color": "#f00"},
+    "status": {"status": "new", "color": "#f00"},
 }
 
 
 def test_primary_paths_are_real_pointers_from_the_first_response(tmp_path) -> None:
     """The caller sees usable pointers on the minting response, not just a rule about them."""
     store = _store(tmp_path)
-    artifact = store.write(_envelope(_CLICKUP_LIKE), owner="operator", environment="sandbox")
+    artifact = store.write(_envelope(_SAMPLE_RECORD), owner="operator", environment="sandbox")
 
     assert artifact["responseRoot"] == "/response"
     assert "/response" in artifact["primaryPaths"]
@@ -672,7 +675,7 @@ def test_primary_paths_are_real_pointers_from_the_first_response(tmp_path) -> No
 def test_every_primary_path_resolves(tmp_path) -> None:
     """A pointer we advertise must not raise; that would be worse than advertising none."""
     store = _store(tmp_path)
-    artifact = store.write(_envelope(_CLICKUP_LIKE), owner="operator", environment="sandbox")
+    artifact = store.write(_envelope(_SAMPLE_RECORD), owner="operator", environment="sandbox")
     for pointer in artifact["primaryPaths"]:
         result = store.query(
             artifact["id"], owner="operator", environment="sandbox",
@@ -684,7 +687,7 @@ def test_every_primary_path_resolves(tmp_path) -> None:
 
 def test_describe_returns_shape_not_values(tmp_path) -> None:
     store = _store(tmp_path)
-    artifact = store.write(_envelope(_CLICKUP_LIKE), owner="operator", environment="sandbox")
+    artifact = store.write(_envelope(_SAMPLE_RECORD), owner="operator", environment="sandbox")
     result = store.query(
         artifact["id"], owner="operator", environment="sandbox",
         response_path="/response", fields=None, response_filter=None,
@@ -692,7 +695,7 @@ def test_describe_returns_shape_not_values(tmp_path) -> None:
     )
 
     shape = result["shape"]
-    assert result["responseMeta"]["contractVersion"] == 1
+    assert result["responseMeta"]["contractVersion"] == 2
     assert "artifact" not in result["responseMeta"]
     assert shape["type"] == "object"
     assert shape["keyCount"] == 4
@@ -702,7 +705,7 @@ def test_describe_returns_shape_not_values(tmp_path) -> None:
     assert names["custom_fields"]["pointer"] == "/response/custom_fields"
     assert names["status"]["type"] == "object"
     # Values must not leak into a shape description.
-    assert "Marie Tremblay" not in json.dumps(result)
+    assert "Example Person" not in json.dumps(result)
     assert "2026-09-12" not in json.dumps(result)
 
 
@@ -728,7 +731,7 @@ def test_describe_of_an_array_shows_length_and_item_shape(tmp_path) -> None:
 def test_describe_of_the_root_names_the_response_wrapper(tmp_path) -> None:
     """Describing the root is how a caller discovers that data hides under /response."""
     store = _store(tmp_path)
-    artifact = store.write(_envelope(_CLICKUP_LIKE), owner="operator", environment="sandbox")
+    artifact = store.write(_envelope(_SAMPLE_RECORD), owner="operator", environment="sandbox")
     result = store.query(
         artifact["id"], owner="operator", environment="sandbox",
         response_path="", fields=None, response_filter=None,
@@ -741,7 +744,7 @@ def test_describe_of_the_root_names_the_response_wrapper(tmp_path) -> None:
 def test_describe_refuses_to_be_combined(tmp_path) -> None:
     """Silently ignoring these would present an unfiltered shape as if it were filtered."""
     store = _store(tmp_path)
-    artifact = store.write(_envelope(_CLICKUP_LIKE), owner="operator", environment="sandbox")
+    artifact = store.write(_envelope(_SAMPLE_RECORD), owner="operator", environment="sandbox")
     for kwargs in (
         {"fields": ["/id"]},
         {"response_filter": [{"path": "/id", "value": 1}]},
@@ -815,7 +818,7 @@ def test_object_entries_support_generic_key_filters(tmp_path) -> None:
         {"key": "first", "/value/status": "open"},
         {"key": "third", "/value/status": "open"},
     ]
-    assert result["responseMeta"]["contractVersion"] == 1
+    assert result["responseMeta"]["contractVersion"] == 2
     assert "artifact" not in result["responseMeta"]
 
 
@@ -840,16 +843,98 @@ def test_compact_threshold_avoids_pretty_print_artifacts_and_caps_previews(tmp_p
     assert len(serialized_bytes(bounded)) <= 8 * 1024
 
 
-def test_pointer_error_still_names_the_bad_pointer(tmp_path) -> None:
-    """The failure Harmony hit 38 times must stay legible."""
+def test_provider_relative_pointer_resolves_to_canonical_path(tmp_path) -> None:
     store = _store(tmp_path)
-    artifact = store.write(_envelope(_CLICKUP_LIKE), owner="operator", environment="sandbox")
-    with pytest.raises(ValueError, match=r'INVALID_RESPONSE_PATH: "/custom_fields"'):
+    artifact = store.write(_envelope(_SAMPLE_RECORD), owner="operator", environment="sandbox")
+    result = store.query(
+        artifact["id"], owner="operator", environment="sandbox",
+        response_path="/custom_fields", fields=None, response_filter=None,
+        response_page_size=20, cursor=None,
+    )
+
+    assert result["responsePath"] == "/response/custom_fields"
+    assert result["responseMeta"]["inferredResponsePath"] == "/response/custom_fields"
+
+
+def test_missing_pointer_reports_attempted_canonical_path(tmp_path) -> None:
+    store = _store(tmp_path)
+    artifact = store.write(_envelope({"items": []}), owner="operator", environment="sandbox")
+
+    with pytest.raises(ValueError, match=r'INVALID_RESPONSE_PATH: "/notPresent"') as raised:
         store.query(
             artifact["id"], owner="operator", environment="sandbox",
-            response_path="/custom_fields", fields=None, response_filter=None,
+            response_path="/notPresent", fields=None, response_filter=None,
             response_page_size=20, cursor=None,
         )
+
+    assert 'tried "/response/notPresent"' in str(raised.value)
+    assert "Available children:" in str(raised.value)
+
+
+def test_relative_and_canonical_paths_share_cursor_view(tmp_path) -> None:
+    store = _store(tmp_path)
+    envelope = _envelope({"items": [{"id": index} for index in range(3)]})
+    first = bound_proxy_response(
+        envelope, owner="operator", environment="sandbox", cursor_key="cursor-key",
+        store=store, response_path="/items", fields=["id"], response_page_size=1,
+    )
+    second = bound_proxy_response(
+        envelope, owner="operator", environment="sandbox", cursor_key="cursor-key",
+        store=store, response_path="/response/items", fields=["id"], response_page_size=1,
+        response_cursor=first["responseMeta"]["nextCursor"],
+    )
+
+    assert first["response"] == [{"id": 0}]
+    assert second["response"] == [{"id": 1}]
+
+
+def test_exact_document_pointer_wins_and_warns_only_for_envelope_collisions(tmp_path) -> None:
+    store = _store(tmp_path)
+    envelope = {
+        **_envelope({"items": [{"id": "provider"}], "status": "provider-status"}),
+        "items": [{"id": "document"}],
+    }
+
+    exact = bound_proxy_response(
+        envelope, owner="operator", environment="sandbox", cursor_key="cursor-key",
+        store=store, response_path="/items", fields=["id"],
+    )
+    collision = bound_proxy_response(
+        envelope, owner="operator", environment="sandbox", cursor_key="cursor-key",
+        store=store, response_path="/status",
+    )
+    provider = bound_proxy_response(
+        envelope, owner="operator", environment="sandbox", cursor_key="cursor-key",
+        store=store, response_path="/response/status",
+    )
+
+    assert exact["response"] == [{"id": "document"}]
+    assert collision["response"] == 200
+    assert 'provider data also exists at "/response/status"' in collision["responseMeta"]["warning"]
+    assert "provider-status" not in collision["responseMeta"]["warning"]
+    assert provider["response"] == "provider-status"
+    assert provider["responseMeta"].get("warning") is None
+
+
+def test_redundant_collection_prefix_is_normalized_only_when_unambiguous(tmp_path) -> None:
+    result = bound_proxy_response(
+        _envelope({"items": [{"id": "item-1", "name": "Example"}]}),
+        owner="operator", environment="sandbox", cursor_key="cursor-key", store=_store(tmp_path),
+        fields=["/items/id", "/items/name"],
+    )
+
+    assert result["response"] == [{"/items/id": "item-1", "/items/name": "Example"}]
+    assert result["responseMeta"]["inferredResponsePath"] == "/response/items"
+    assert "interpreted fields relative" in result["responseMeta"]["warning"]
+
+    mixed = bound_proxy_response(
+        _envelope({"items": [{"id": "item-1", "name": "Example"}]}),
+        owner="operator", environment="sandbox", cursor_key="cursor-key", store=_store(tmp_path),
+        fields=["/items/id", "/name"],
+    )
+    assert mixed["response"] == [{"/name": "Example"}]
+    assert mixed["responseMeta"]["fieldsResolved"]["/items/id"] == 0
+    assert "interpreted fields relative" not in mixed["responseMeta"]["warning"]
 
 
 def test_omitted_response_path_uses_artifact_response_root(tmp_path) -> None:
@@ -881,9 +966,42 @@ def test_slash_pointer_selects_empty_key_property_not_document_root(tmp_path) ->
     assert result["response"] == {"selected": True}
 
 
-def test_artifact_descriptor_uses_v3_and_iso_expiry(tmp_path) -> None:
+def test_artifact_descriptor_uses_v2_and_iso_expiry(tmp_path) -> None:
     artifact = _store(tmp_path).write(_envelope([]), owner="operator", environment="sandbox")
 
+    assert _store(tmp_path).describe(artifact["id"], owner="operator", environment="sandbox")["contractVersion"] == 2
     assert artifact["expiresAt"].endswith("Z")
     assert "expires_at" not in artifact
     assert artifact["queryTool"] == "query_response_artifact"
+
+
+def test_v1_artifact_and_cursor_require_reminting(tmp_path) -> None:
+    store = _store(tmp_path)
+    artifact = store.write(_envelope([{"id": 1}, {"id": 2}]), owner="operator", environment="sandbox")
+    _, meta_path = store._paths(artifact["id"])
+    metadata = json.loads(meta_path.read_text("utf-8"))
+    metadata["contractVersion"] = 1
+    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="mint a v2 artifact"):
+        store.describe(artifact["id"], owner="operator", environment="sandbox")
+
+    fresh = bound_proxy_response(
+        _envelope([{"id": 1}, {"id": 2}]),
+        owner="operator", environment="sandbox", cursor_key="cursor-key", store=store,
+        response_page_size=1,
+    )
+    token = fresh["responseMeta"]["nextCursor"]
+    raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+    state = json.loads(raw[:-32])
+    state["contractVersion"] = 1
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(b"cursor-key", payload, hashlib.sha256).digest()
+    legacy = base64.urlsafe_b64encode(payload + signature).decode("ascii").rstrip("=")
+
+    with pytest.raises(ValueError, match="mint a v2 cursor"):
+        bound_proxy_response(
+            _envelope([{"id": 1}, {"id": 2}]),
+            owner="operator", environment="sandbox", cursor_key="cursor-key", store=store,
+            response_page_size=1, response_cursor=legacy,
+        )
