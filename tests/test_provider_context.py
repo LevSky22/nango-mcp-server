@@ -68,6 +68,9 @@ def test_all_tool_schemas_are_strict_camel_case() -> None:
         "update_connection_metadata": {
             "environment", "connectionId", "providerConfigKey", "metadata", "mode",
         },
+        "update_connection_end_user": {
+            "environment", "connectionId", "providerConfigKey", "id", "email", "displayName",
+        },
         "create_connect_session": {"environment", "allowedIntegrations", "tags", "integrationsConfigDefaults"},
         "create_standard_connect_session": {
             "environment", "providerConfigKey", "principal", "ownerKind", "purpose", "organizationId",
@@ -103,7 +106,10 @@ def test_all_tool_schemas_are_strict_camel_case() -> None:
         schema = tool.parameters
         assert schema["additionalProperties"] is False, name
         assert set(schema.get("properties", {})) == properties, name
-        if name in {"proxy_request", "query_response_artifact", "stage_proxy_request_body"}:
+        if name in {
+            "proxy_request", "query_response_artifact", "stage_proxy_request_body",
+            "update_connection_end_user",
+        }:
             assert tool.output_schema is not None, name
 
         def assert_no_null_defaults(value: object) -> None:

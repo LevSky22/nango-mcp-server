@@ -105,6 +105,37 @@ async def test_update_connection_metadata_uses_documented_body_shape() -> None:
 
 
 @pytest.mark.asyncio
+async def test_patch_connection_uses_native_end_user_endpoint_shape() -> None:
+    client = CapturingNangoClient()
+
+    await client.patch_connection(
+        "nango-secret",
+        "sample-connection",
+        "sample-integration",
+        end_user={
+            "id": "person-1", "email": "person@example.test",
+            "display_name": "Example Person", "tags": {"segment": "standard"},
+        },
+        tags={"source": "dashboard"},
+    )
+
+    assert client.calls == [{
+        "secret_key": "nango-secret",
+        "method": "PATCH",
+        "path": "/connections/sample-connection",
+        "params": {"provider_config_key": "sample-integration"},
+        "body": {
+            "end_user": {
+                "id": "person-1", "email": "person@example.test",
+                "display_name": "Example Person", "tags": {"segment": "standard"},
+            },
+            "tags": {"source": "dashboard"},
+        },
+        "headers": None,
+    }]
+
+
+@pytest.mark.asyncio
 async def test_create_connect_session_adds_self_hosted_api_url_to_connect_link() -> None:
     client = ConnectSessionNangoClient()
 

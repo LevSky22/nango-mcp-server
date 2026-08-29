@@ -88,6 +88,12 @@ All tools that accept `environment` enforce the authenticated caller's environme
 
 **Write.** Merges or replaces connection metadata according to `mode`, which defaults to `merge`. Metadata is for application configuration, not credentials or large synchronized datasets.
 
+### `update_connection_end_user`
+
+**Write, native identity.** Updates only Nango's native connection `end_user.id`, `email`, and `display_name`; this is distinct from `replace_connection_tags` and `update_connection_metadata`. The tool preserves omitted identity fields and non-derived tags, rejects shared or conflicting IDs, blocks organization-linked identities, models Nango's 10-tag behavior before mutation, and verifies the native fields and preserved tags by read-back. It never returns credentials or the upstream mutation response.
+
+The organization guard is intentional: Nango's connection PATCH endpoint was introduced in [Nango PR #4549](https://github.com/NangoHQ/nango/pull/4549), and the upstream organization-clearing behavior is tracked in [Nango issue #7297](https://github.com/NangoHQ/nango/issues/7297).
+
 ## Connect sessions
 
 ### `create_connect_session`

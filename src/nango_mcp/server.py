@@ -16,7 +16,7 @@ from mcp.server import MCPServer
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.context import ServerRequestContext
 from mcp.server.lowlevel.helper_types import ReadResourceContents
-from mcp.server.mcpserver.exceptions import ResourceError
+from mcp.server.mcpserver.exceptions import ResourceError, ToolError
 from mcp.server.mcpserver import Context
 from mcp.server.request_state import RequestStateBoundary, RequestStateSecurity
 from mcp.server.transport_security import TransportSecuritySettings
@@ -86,6 +86,11 @@ SECRET_KEY_FRAGMENTS = (
 INLINE_MUTATION_BODY_MAX_BYTES = 4 * 1024
 INLINE_MUTATION_BODY_MAX_COLLECTION_ENTRIES = 40
 INLINE_MUTATION_BODY_MAX_DEPTH = 8
+DERIVED_END_USER_TAG_KEYS = frozenset({
+    "end_user_id",
+    "end_user_email",
+    "end_user_display_name",
+})
 
 PROXY_TOOL_META = {
     "io.github.levsky22/operation-risk": {
@@ -218,6 +223,27 @@ class MutationBodyArtifactResult(BaseModel):
     rawReadable: Literal[False]
     queryable: Literal[False]
     usage: str
+
+
+class ConnectionEndUserSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    email: str | None
+    displayName: str | None
+
+
+class ConnectionEndUserUpdateResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    environment: str
+    providerConfigKey: str
+    connectionId: str
+    endUser: ConnectionEndUserSummary
+    verified: Literal[True]
+    preservedConnectionTagCount: int = Field(ge=0)
+    preservedEndUserTagCount: int = Field(ge=0)
+    secretMaterialReturned: Literal[False]
 
 
 def _request_state_principal(_: ServerRequestContext[Any, Any]) -> str:
@@ -535,6 +561,7 @@ MUTATION_EFFECTS = {
     "delete_connection": "destructive",
     "replace_connection_tags": "low",
     "update_connection_metadata": "low",
+    "update_connection_end_user": "low",
     "create_connect_session": "elevated",
     "create_standard_connect_session": "elevated",
     "create_reconnect_session": "elevated",
@@ -602,6 +629,10 @@ class MutationApprovalError(PermissionError):
     pass
 
 
+class ConnectionEndUserUpdateError(ToolError):
+    """A native end-user update failed a wrapper safety invariant."""
+
+
 class LegacyMutationApproval(BaseModel):
     approve: bool = Field(title="Approve this mutation")
 
@@ -622,7 +653,8 @@ def _approval_message(tool: str, environment: str, args: tuple[Any, ...]) -> str
         target = f" integration={args[0]}"
     elif tool in {
         "refresh_connection_credentials", "delete_connection", "replace_connection_tags",
-        "update_connection_metadata", "create_reconnect_session", "apply_connection_convention",
+        "update_connection_metadata", "update_connection_end_user", "create_reconnect_session",
+        "apply_connection_convention",
     } and len(args) >= 2:
         target = f" connection={args[0]} integration={args[1]}"
     elif tool == "proxy_request" and len(args) >= 4:
@@ -653,7 +685,8 @@ async def _target_snapshot(tool: str, environment: str, args: tuple[Any, ...]) -
         target = await nango.get_integration(secret.nango_secret_key, str(args[0]))
     elif tool in {
         "refresh_connection_credentials", "delete_connection", "replace_connection_tags",
-        "update_connection_metadata", "create_reconnect_session", "apply_connection_convention",
+        "update_connection_metadata", "update_connection_end_user", "create_reconnect_session",
+        "apply_connection_convention",
     }:
         _, nango, secret = await _resolve(environment)
         target = await nango.get_connection(secret.nango_secret_key, str(args[0]), str(args[1]))
@@ -1164,6 +1197,276 @@ async def update_connection_metadata(
             metadata,
             mode=mode,
         )
+    )
+
+
+def _native_end_user(connection: Any) -> dict[str, Any]:
+    if not isinstance(connection, dict):
+        return {}
+    value = _first_present(connection, ("end_user", "endUser"))
+    return value if isinstance(value, dict) else {}
+
+
+def _native_end_user_organization(connection: Any, end_user: dict[str, Any]) -> Any:
+    organization = _first_present(end_user, ("organization",))
+    if organization:
+        return organization
+    if not isinstance(connection, dict):
+        return None
+    return _first_present(
+        connection,
+        ("organization", "end_user_organization", "endUserOrganization"),
+    )
+
+
+def _identity_text(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ConnectionEndUserUpdateError(
+            f"INVALID_END_USER_IDENTITY: {field_name} must not be blank"
+        )
+    if len(normalized) > 255:
+        raise ConnectionEndUserUpdateError(
+            f"INVALID_END_USER_IDENTITY: {field_name} exceeds 255 characters"
+        )
+    return normalized
+
+
+def _without_derived_identity_tags(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if str(key).lower() not in DERIVED_END_USER_TAG_KEYS and isinstance(item, str)
+    }
+
+
+def _projected_connection_tag_state(
+    connection_tags: dict[str, str],
+    end_user_tags: dict[str, str],
+    *,
+    has_email: bool,
+    has_display_name: bool,
+) -> tuple[set[str], bool]:
+    """Model Nango's generated-tag limit and report destructive tag fallback."""
+    derived = {
+        "end_user_id",
+        *({"end_user_email"} if has_email else set()),
+        *({"end_user_display_name"} if has_display_name else set()),
+    }
+    normalized_end_user = {key.lower() for key in end_user_tags}
+    generated = derived | normalized_end_user
+    would_drop_end_user_tags = bool(normalized_end_user) and len(generated) > 10
+    effective_generated = derived if len(generated) > 10 else generated
+    return effective_generated | {key.lower() for key in connection_tags}, would_drop_end_user_tags
+
+
+def _connection_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        payload = payload.get("connections", payload.get("data"))
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def _is_connection_target(
+    connection: dict[str, Any],
+    connection_id: str,
+    provider_config_key: str,
+) -> bool:
+    return (
+        _first_present(connection, ("connection_id", "connectionId")) == connection_id
+        and _first_present(connection, ("provider_config_key", "providerConfigKey"))
+        == provider_config_key
+    )
+
+
+async def _require_exclusive_end_user_link(
+    nango: NangoClient,
+    secret_key: str,
+    *,
+    current_end_user_id: str | None,
+    requested_end_user_id: str,
+    connection_id: str,
+    provider_config_key: str,
+) -> None:
+    if current_end_user_id:
+        linked = _connection_rows(
+            await nango.list_connections(secret_key, {"endUserId": current_end_user_id, "limit": 2})
+        )
+        if len(linked) != 1 or not _is_connection_target(
+            linked[0], connection_id, provider_config_key
+        ):
+            raise ConnectionEndUserUpdateError(
+                "END_USER_SHARED_CONNECTION_UNSUPPORTED: native end_user is not exclusively linked to the target connection"
+            )
+    if requested_end_user_id != current_end_user_id:
+        conflicts = _connection_rows(
+            await nango.list_connections(secret_key, {"endUserId": requested_end_user_id, "limit": 1})
+        )
+        if conflicts:
+            raise ConnectionEndUserUpdateError(
+                "END_USER_ID_CONFLICT: requested native end-user id is already linked to another connection"
+            )
+
+
+@mcp.tool(structured_output=True)
+async def update_connection_end_user(
+    ctx: Context,
+    environment: str,
+    connectionId: str,
+    providerConfigKey: str,
+    id: str | None = None,
+    email: str | None = None,
+    displayName: str | None = None,
+) -> Annotated[CallToolResult, ConnectionEndUserUpdateResult]:
+    """Safely update native Nango end-user identity and verify it by read-back."""
+    requested = {
+        "id": _identity_text(id, "id"),
+        "email": _identity_text(email, "email"),
+        "display_name": _identity_text(displayName, "displayName"),
+    }
+    if not any(value is not None for value in requested.values()):
+        raise ConnectionEndUserUpdateError(
+            "INVALID_END_USER_IDENTITY: supply at least one of id, email, or displayName"
+        )
+    approval = await _authorize_mutation(
+        ctx,
+        "update_connection_end_user",
+        environment,
+        (connectionId, providerConfigKey, requested["id"], requested["email"], requested["display_name"]),
+    )
+    if approval:
+        return approval
+
+    _, nango, secret = await _resolve(environment)
+    existing = await nango.get_connection(secret.nango_secret_key, connectionId, providerConfigKey)
+    existing_end_user = _native_end_user(existing)
+    if _native_end_user_organization(existing, existing_end_user):
+        raise ConnectionEndUserUpdateError(
+            "END_USER_ORGANIZATION_UNSUPPORTED: Nango's connection PATCH can clear the native organization"
+        )
+
+    merged_id = requested["id"] or _first_present(existing_end_user, ("id",))
+    if not isinstance(merged_id, str) or not merged_id.strip():
+        raise ConnectionEndUserUpdateError(
+            "END_USER_ID_REQUIRED: the connection has no native end user, so id must be supplied"
+        )
+    merged_id = merged_id.strip()
+    merged_email = requested["email"] if requested["email"] is not None else _first_present(existing_end_user, ("email",))
+    merged_display_name = (
+        requested["display_name"]
+        if requested["display_name"] is not None
+        else _first_present(existing_end_user, ("display_name", "displayName"))
+    )
+    preserved_end_user_tags = _without_derived_identity_tags(existing_end_user.get("tags"))
+    preserved_connection_tags = _without_derived_identity_tags(
+        existing.get("tags") if isinstance(existing, dict) else None
+    )
+
+    current_end_user_id = _first_present(existing_end_user, ("id",))
+    await _require_exclusive_end_user_link(
+        nango,
+        secret.nango_secret_key,
+        current_end_user_id=current_end_user_id if isinstance(current_end_user_id, str) else None,
+        requested_end_user_id=merged_id,
+        connection_id=connectionId,
+        provider_config_key=providerConfigKey,
+    )
+
+    end_user_payload: dict[str, Any] = {"id": merged_id, "tags": preserved_end_user_tags}
+    if isinstance(merged_email, str) and merged_email:
+        end_user_payload["email"] = merged_email
+    if isinstance(merged_display_name, str) and merged_display_name:
+        end_user_payload["display_name"] = merged_display_name
+
+    preflight_tag_keys, would_drop_end_user_tags = _projected_connection_tag_state(
+        preserved_connection_tags,
+        preserved_end_user_tags,
+        has_email="email" in end_user_payload,
+        has_display_name="display_name" in end_user_payload,
+    )
+    if would_drop_end_user_tags:
+        raise ConnectionEndUserUpdateError(
+            "END_USER_TAG_CAPACITY_EXCEEDED: updating identity would cause Nango to drop preserved end-user tags"
+        )
+    if len(preflight_tag_keys) > 10:
+        raise ConnectionEndUserUpdateError(
+            "END_USER_TAG_CAPACITY_EXCEEDED: updating identity would exceed Nango's 10-tag connection limit"
+        )
+
+    await nango.patch_connection(
+        secret.nango_secret_key,
+        connectionId,
+        providerConfigKey,
+        end_user=end_user_payload,
+        tags=preserved_connection_tags,
+    )
+    refreshed = await nango.get_connection(secret.nango_secret_key, connectionId, providerConfigKey)
+    refreshed_end_user = _native_end_user(refreshed)
+    actual = {
+        "id": _first_present(refreshed_end_user, ("id",)),
+        "email": _first_present(refreshed_end_user, ("email",)),
+        "display_name": _first_present(refreshed_end_user, ("display_name", "displayName")),
+    }
+    expected = {
+        "id": end_user_payload["id"],
+        "email": end_user_payload.get("email"),
+        "display_name": end_user_payload.get("display_name"),
+    }
+    refreshed_connection_tags = refreshed.get("tags") if isinstance(refreshed, dict) else None
+    refreshed_end_user_tags = refreshed_end_user.get("tags")
+    expected_derived_tags = {
+        "end_user_id": expected["id"],
+        **({"end_user_email": expected["email"]} if expected["email"] is not None else {}),
+        **(
+            {"end_user_display_name": expected["display_name"]}
+            if expected["display_name"] is not None
+            else {}
+        ),
+    }
+    tags_preserved = (
+        isinstance(refreshed_connection_tags, dict)
+        and all(refreshed_connection_tags.get(key) == value for key, value in preserved_connection_tags.items())
+        and isinstance(refreshed_end_user_tags, dict)
+        and all(refreshed_end_user_tags.get(key) == value for key, value in preserved_end_user_tags.items())
+    )
+    derived_tags_verified = isinstance(refreshed_connection_tags, dict) and all(
+        refreshed_connection_tags.get(key) == value for key, value in expected_derived_tags.items()
+    ) and all(
+        key in expected_derived_tags or key not in refreshed_connection_tags
+        for key in DERIVED_END_USER_TAG_KEYS
+    )
+    if (
+        actual != expected
+        or _native_end_user_organization(refreshed, refreshed_end_user)
+        or not tags_preserved
+        or not derived_tags_verified
+    ):
+        raise ConnectionEndUserUpdateError(
+            "END_USER_VERIFICATION_FAILED: native identity or preserved tags did not match after PATCH"
+        )
+
+    result = {
+        "environment": secret.environment,
+        "providerConfigKey": providerConfigKey,
+        "connectionId": connectionId,
+        "endUser": {
+            "id": expected["id"],
+            "email": expected["email"],
+            "displayName": expected["display_name"],
+        },
+        "verified": True,
+        "preservedConnectionTagCount": len(preserved_connection_tags),
+        "preservedEndUserTagCount": len(preserved_end_user_tags),
+        "secretMaterialReturned": False,
+    }
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(result, separators=(",", ":")))],
+        structuredContent=result,
     )
 
 
