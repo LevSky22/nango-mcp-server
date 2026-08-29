@@ -22,13 +22,13 @@ Version 1.0 provides:
 Run directly with `uvx`:
 
 ```bash
-uvx --from git+https://github.com/LevSky22/nango-mcp-server.git@v1.0.0 nango-mcp
+uvx --from git+https://github.com/LevSky22/nango-mcp-server.git@v2.0.0 nango-mcp
 ```
 
 Or install persistently:
 
 ```bash
-pipx install git+https://github.com/LevSky22/nango-mcp-server.git@v1.0.0
+pipx install git+https://github.com/LevSky22/nango-mcp-server.git@v2.0.0
 ```
 
 For development:
@@ -77,7 +77,7 @@ Generic MCP client configuration:
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/LevSky22/nango-mcp-server.git@v1.0.0",
+        "git+https://github.com/LevSky22/nango-mcp-server.git@v2.0.0",
         "nango-mcp"
       ],
       "env": {
@@ -257,7 +257,7 @@ NANGO_MCP_INFISICAL_SECRET_NAME=NANGO_SECRET_KEY
 Build locally:
 
 ```bash
-docker build -t nango-mcp:1.0.0 .
+docker build -t nango-mcp:2.0.0 .
 ```
 
 HTTP containers must receive the Nango secret configuration, authentication policy, and request-state keys at runtime. Do not bake secrets into an image.

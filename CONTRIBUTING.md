@@ -15,7 +15,9 @@ python -m pytest -q
 - Run `python -m pytest -q`.
 - Keep changes focused on one behavior or bug fix.
 - Update `README.md` or `.env.example` when configuration or tool behavior changes.
+- Update `MIGRATION.md` for breaking wire-contract changes and keep tool headings in `docs/tools.md` synchronized with `tools/list`.
 - Do not commit `.env`, secrets, OAuth tokens, provider payloads, or customer data.
+- Use neutral fixtures such as `sandbox`, `sample-integration`, and `person@example.test`; never copy private deployment names, aliases, routes, or identifiers into public changes.
 - Prefer tests around request shape and redaction behavior when touching Nango API calls.
 
 ## Security And Secret Handling
@@ -31,6 +33,7 @@ python -m pytest -q
 - Use clear Python type hints for public helpers and tool-facing data structures.
 - Keep management API responses redacted for credential-like fields.
 - Keep write/delete guardrails intact unless a replacement safety model is added.
+- Preserve the query-only boundary for stored JSON values. Resource links may expose bounded descriptors; provider binary downloads are the only raw-readable artifact resources.
 
 ## Licensing
 

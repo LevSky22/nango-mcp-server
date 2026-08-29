@@ -273,7 +273,7 @@ class ToolPolicyMiddleware:
 
 mcp = PublicNangoMCPServer(
     name="Nango MCP Server",
-    version="1.0.0",
+    version="2.0.0",
     instructions=(
         "Operate one or more Nango environments through the Nango REST API and Proxy. "
         "The default resolver reads Nango secret keys from environment variables or a .env file; "

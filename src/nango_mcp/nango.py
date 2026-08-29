@@ -481,8 +481,8 @@ class NangoClient:
         body: Any | None = None,
     ) -> Any:
         normalized_method = method.upper().strip()
-        if normalized_method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
-            raise ValueError("method must be one of GET, POST, PUT, PATCH, DELETE")
+        if normalized_method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
+            raise ValueError("method must be one of GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE")
 
         proxy_headers = self._proxy_headers(
             provider_config_key,

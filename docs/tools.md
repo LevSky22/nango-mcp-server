@@ -1,6 +1,6 @@
 # Tool reference
 
-Nango MCP Server exposes 26 tools. This page explains when to use them and highlights behavior that is easy to miss. The MCP `tools/list` response is authoritative for exact JSON Schema types, required fields, and defaults.
+Nango MCP Server exposes 28 tools. This page explains when to use them and highlights behavior that is easy to miss. The MCP `tools/list` response is authoritative for exact JSON Schema types, required fields, and defaults.
 
 Access labels describe intent:
 

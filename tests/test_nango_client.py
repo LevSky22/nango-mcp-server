@@ -293,6 +293,18 @@ async def test_proxy_request_returns_http_envelope() -> None:
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["HEAD", "OPTIONS"])
+async def test_proxy_request_supports_idempotent_discovery_methods(method: str) -> None:
+    client = CapturingNangoClient()
+
+    await client.proxy_request(
+        "nango-secret", "sample-integration", "sample-connection", method, "/items"
+    )
+
+    assert client.calls[0]["method"] == method
+
+
 @pytest.mark.parametrize("content_type", ["application/problem+json", "text/plain", ""])
 def test_proxy_response_recovers_complete_structured_json(content_type: str) -> None:
     client = NangoClient("https://nango.example.test")
