@@ -6,15 +6,18 @@ Created by Lev Jampolsky at ValStratis.
 
 This independent project is not affiliated with or endorsed by Nango. See [Nango](https://www.nango.dev/), the [Nango repository](https://github.com/NangoHQ/nango), and [Nango documentation](https://nango.dev/docs).
 
-Version 1.0 provides:
+Version 2.0 provides:
 
 - stdio by default and optional Streamable HTTP at `/mcp`
 - direct environment secrets or optional Infisical resolution
 - static bearer policies or OAuth protected-resource authorization for HTTP
-- native MCP approval flows for mutations
+- 28 tools with strict camelCase inputs and documented connection filters
+- native MCP approval flows, including conservative trusted-host review for exact-target provider deletes
 - redacted Nango management responses
+- safe native connection end-user updates with preflight and read-back verification
 - provider requests through Nango Proxy with safe 429 retry behavior
-- bounded structured results, protected response artifacts, and resource links
+- immutable staging for large outbound mutation bodies
+- bounded structured results and contract-v2 response artifacts with a query-only JSON boundary
 - streamed provider downloads exposed as protected MCP resources
 
 ## Install
@@ -274,7 +277,7 @@ CI tests Python 3.11 through 3.13, builds the distribution, checks package metad
 
 Do not put Nango keys, OAuth tokens, Infisical credentials, provider payloads, or customer data in issues, tests, fixtures, logs, or commits. Audit logs contain identities, tool names, outcomes, timing, and bounded operational metadata—not tokens, headers, arguments, or payloads.
 
-See [MIGRATION.md](MIGRATION.md) when upgrading from 0.x.
+See [MIGRATION.md](MIGRATION.md) when upgrading from 1.x or 0.x.
 
 ## License
 
