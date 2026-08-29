@@ -219,14 +219,14 @@ Rate-limit handling distinguishes Nango gateway throttles from forwarded provide
 
 ## Tools
 
-The server exposes 27 tools, grouped by workflow:
+The server exposes 28 tools, grouped by workflow:
 
 | Area | Tools | Access |
 | --- | --- | --- |
 | Environments | `list_environments`, `check_environment` | Read |
 | Provider discovery | `search_provider_templates`, `download_provider_file` | Read |
 | Integrations | `list_integrations`, `get_integration`, `create_integration`, `update_integration`, `delete_integration` | Read/write |
-| Connections | `list_connections`, `get_connection`, `get_connection_context`, `refresh_connection_credentials`, `import_connection`, `delete_connection` | Read/write |
+| Connections | `list_connections`, `get_connection`, `get_connection_context`, `refresh_connection_credentials`, `import_connection`, `delete_connection`, `update_connection_end_user` | Read/write |
 | Tags and metadata | `replace_connection_tags`, `update_connection_metadata` | Write |
 | Connect sessions | `create_connect_session`, `create_standard_connect_session`, `create_reconnect_session` | Write |
 | Provider API and large responses | `stage_proxy_request_body`, `proxy_request`, `query_response_artifact` | Read/write |
@@ -236,7 +236,7 @@ See the [complete tool reference](https://github.com/LevSky22/nango-mcp-server/b
 
 Management responses redact credential-like fields. `refresh_connection_credentials` returns only a non-secret summary. Proxy methods other than GET/HEAD/OPTIONS and all other mutations follow the approval policy described above.
 
-The connection convention helpers are optional. They generate generic Nango tags and metadata; they are not profiles and do not discover organizations or impose deployment-specific policy.
+The connection convention helpers are optional. They generate generic Nango tags and metadata; they are not profiles and do not discover organizations or impose deployment-specific policy. `update_connection_end_user` is deliberately separate: it changes Nango's native `end_user` identity, preserves both tag layers, blocks organization-linked identities, and verifies the result by read-back.
 
 ## Optional Infisical resolver
 
